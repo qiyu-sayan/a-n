@@ -1,0 +1,7 @@
+mode: normal
+symbol: ethereum
+currency: usd
+fast_interval: 5
+normal_interval: 60
+data_dir: data
+log_file: logs/app.log
