@@ -1,7 +1,12 @@
-mode: normal
-symbol: ethereum
-currency: usd
-fast_interval: 5
-normal_interval: 60
-data_dir: data
-log_file: logs/app.log
+mode: paper              # 先纸面交易；后面会加 real/testnet
+symbol: ETHUSDT          # 交易标的（Binance 现货符号）
+timeframe: 1m            # 使用 1分钟 K 线
+loop_interval_sec: 5     # 主循环频率（与你现在 5 秒一次匹配）
+sma_fast: 20             # 快均线
+sma_slow: 50             # 慢均线
+rsi_period: 14           # RSI周期
+rsi_buy: 55              # RSI 买入阈值（与金叉共振）
+rsi_sell: 45             # RSI 卖出阈值（与死叉共振）
+trade_notional_usdt: 50  # 每次“纸面下单”的名义金额（USDT）
+taker_fee: 0.001         # 手续费假设（万3=0.0003；这里先千1）
+log_dir: /var/log/crypto-bot
