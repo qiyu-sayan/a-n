@@ -1,11 +1,16 @@
-# 运行模式
-dry_run: true            # true=只记录日志不下单；上线改成 false
+dry_run: true          # 上线改 false
 
-# 采集配置
-symbols:
-  - BTCUSDT
-  - ETHUSDT
-poll_seconds: 60         # 轮询周期（秒）
+# 采集
+symbols: [BTCUSDT, ETHUSDT]
+poll_seconds: 60       # 建议 >= 60，和 1m K线对齐
+log_level: INFO
 
-# 日志
-log_level: INFO          # DEBUG/INFO/WARN/ERROR
+# 策略（双均线）
+strategy:
+  type: sma
+  interval: "1m"      # 使用 1m K线
+  fast: 12
+  slow: 26
+  qty: 0.001          # 模拟下单数量（dry_run 仅打印）
+  take_profit: 0.03   # 浮动盈利 3% 止盈
+  stop_loss: 0.01     # 浮动亏损 1% 止损
