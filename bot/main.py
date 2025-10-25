@@ -1,178 +1,122 @@
-import os, time, json, csv, math, sys, signal
-import requests
-import pandas as pd
-import numpy as np
+import os
+import sys
+import time
+import json
 import yaml
+import signal
+import logging
+import requests
+import subprocess
 from datetime import datetime, timezone
 
-# ---------- utils ----------
-def utcnow_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
+CONFIG_PATH = os.environ.get("BOT_CONFIG", "config.yaml")
 
-def ensure_dir(p):
-    os.makedirs(p, exist_ok=True)
-
-def load_config(path):
+def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
+    # 默认值
+    cfg.setdefault("dry_run", True)
+    cfg.setdefault("symbols", ["BTCUSDT"])
+    cfg.setdefault("poll_seconds", 60)
+    cfg.setdefault("log_level", "INFO")
+    return cfg
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / (loss.replace(0, np.nan))
-    return 100 - (100 / (1 + rs))
+def setup_logger(level: str):
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=lvl,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    # Binance 公共 K 线（不需要密钥）
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    raw = r.json()
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "qav","trades","taker_base","taker_quote","ignore"]
-    df = pd.DataFrame(raw, columns=cols)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    for c in ["open","high","low","close","volume","qav","taker_base","taker_quote"]:
-        df[c] = df[c].astype(float)
-    return df
+def get_git_rev() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return out
+    except Exception:
+        return "unknown"
 
-# ---------- paper portfolio ----------
-class PaperBroker:
-    def __init__(self, log_dir, fee):
-        self.state_file = os.path.join(log_dir, "paper_state.json")
-        self.trades_file = os.path.join(log_dir, "trades.csv")
-        self.fee = fee
-        ensure_dir(log_dir)
-        if not os.path.exists(self.trades_file):
-            with open(self.trades_file, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["ts_utc","side","price","qty","notional","fee","position_after","cash_after"])
-        if os.path.exists(self.state_file):
-            with open(self.state_file, "r", encoding="utf-8") as f:
-                self.state = json.load(f)
-        else:
-            # 初始 1000 USDT 纸面资产（可改）
-            self.state = {"position": 0.0, "cash": 1000.0}
-            self._save()
+def health_line(cfg: dict):
+    line = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "app": "crypto-bot",
+        "version": get_git_rev(),
+        "mode": "DRY_RUN" if cfg.get("dry_run") else "LIVE",
+        "symbols": cfg.get("symbols"),
+        "poll_seconds": cfg.get("poll_seconds"),
+    }
+    # 用一行 JSON 当健康检查标记，方便日志检索
+    logging.info(f"HEALTH {json.dumps(line, ensure_ascii=False)}")
 
-    def _save(self):
-        with open(self.state_file, "w", encoding="utf-8") as f:
-            json.dump(self.state, f)
+class Stopper:
+    def __init__(self):
+        self.stop = False
+        signal.signal(signal.SIGINT, self._sig)
+        signal.signal(signal.SIGTERM, self._sig)
+    def _sig(self, *_):
+        self.stop = True
 
-    def buy(self, price, notional):
-        qty = notional / price
-        fee = notional * self.fee
-        if self.state["cash"] < notional + fee:
-            return False, "INSUFFICIENT_CASH"
-        self.state["cash"] -= (notional + fee)
-        self.state["position"] += qty
-        self._save()
-        self._log_trade("BUY", price, qty, notional, fee)
-        return True, "OK"
+def fetch_price(symbol: str) -> float | None:
+    url = "https://api.binance.com/api/v3/ticker/price"
+    try:
+        r = requests.get(url, params={"symbol": symbol}, timeout=10)
+        if r.status_code != 200:
+            logging.warning(f"{symbol} http {r.status_code}: {r.text[:200]}")
+            return None
+        data = r.json()
+        return float(data["price"])
+    except Exception as e:
+        logging.warning(f"{symbol} fetch error: {e}")
+        return None
 
-    def sell(self, price, qty):
-        if self.state["position"] < qty:
-            return False, "INSUFFICIENT_POSITION"
-        notional = qty * price
-        fee = notional * self.fee
-        self.state["cash"] += (notional - fee)
-        self.state["position"] -= qty
-        self._save()
-        self._log_trade("SELL", price, qty, notional, fee)
-        return True, "OK"
-
-    def _log_trade(self, side, price, qty, notional, fee):
-        with open(self.trades_file, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([utcnow_str(), side, price, qty, notional, fee, self.state["position"], self.state["cash"]])
-
-# ---------- main bot ----------
 def main():
-    cfg_path = os.environ.get("CRYPTO_BOT_CONFIG", "/opt/projects/a-n/config.yaml")
-    cfg = load_config(cfg_path)
+    cfg = load_config(CONFIG_PATH)
+    setup_logger(cfg["log_level"])
+    health_line(cfg)
 
-    log_dir = cfg.get("log_dir", "/var/log/crypto-bot")
-    ensure_dir(log_dir)
-    app_log = os.path.join(log_dir, "app.log")
+    stopper = Stopper()
+    interval = max(5, int(cfg["poll_seconds"]))  # 最小 5s，避免太快
+    dry_run = bool(cfg["dry_run"])
+    symbols = list(cfg["symbols"])
 
-    def log(msg):
-        line = f"[{utcnow_str()}] {msg}"
-        print(line, flush=True)
-        with open(app_log, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+    logging.info(f"Start loop: symbols={symbols}, interval={interval}s, dry_run={dry_run}")
 
-    # 纸面经纪
-    broker = PaperBroker(log_dir, fee=cfg["taker_fee"])
+    # ===== 你的策略逻辑入口（占位）=====
+    # 你只需把计算/信号/下单封装成函数，在循环里调用即可。
+    # 这里只做基础行情采集 + 打印示例。
+    # =================================
 
-    loop_sec = int(cfg.get("loop_interval_sec", 5))
-    symbol = cfg["symbol"]
-    tf = cfg["timeframe"]
-    fast = int(cfg["sma_fast"])
-    slow = int(cfg["sma_slow"])
-    rsi_p = int(cfg["rsi_period"])
-    rsi_buy = float(cfg["rsi_buy"])
-    rsi_sell = float(cfg["rsi_sell"])
-    trade_notional = float(cfg["trade_notional_usdt"])
+    while not stopper.stop:
+        start = time.time()
+        for sym in symbols:
+            px = fetch_price(sym)
+            if px is None:
+                continue
 
-    # 优雅退出
-    stop = False
-    def handler(sig, frame): 
-        nonlocal stop
-        stop = True
-        log("stop signal received")
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
+            # 打印一行“行情心跳”
+            logging.info(f"PRICE {sym}={px:.2f}")
 
-    log(f"Bot start: mode={cfg['mode']} symbol={symbol} tf={tf} loop={loop_sec}s")
+            # ==== 示例策略占位 ====
+            # signal = your_strategy(px, sym)
+            # if not dry_run and signal.should_trade:
+            #     place_order(signal)
+            #     logging.info(f"TRADE {signal}")
+            # else:
+            #     logging.debug(f"DRY {signal}")
+            # ======================
 
-    last_cross = None  # 记录上一次均线方向：'golden' 或 'dead'
-    while not stop:
-        try:
-            df = fetch_klines(symbol, tf, limit=max(200, slow + 50))
-            close = df["close"]
-            df["sma_fast"] = close.rolling(fast).mean()
-            df["sma_slow"] = close.rolling(slow).mean()
-            df["rsi"] = rsi(close, rsi_p)
+        # 每轮输出一个健康行（便于长时间观测）
+        health_line(cfg)
 
-            row = df.iloc[-1]
-            price = float(row["close"])
-            fma = float(row["sma_fast"])
-            sma = float(row["sma_slow"])
-            rsi_now = float(row["rsi"])
+        # 睡眠至下个周期
+        elapsed = time.time() - start
+        time.sleep(max(0.0, interval - elapsed))
 
-            cross = None
-            prev = df.iloc[-2]
-            if prev["sma_fast"] <= prev["sma_slow"] and fma > sma:
-                cross = "golden"
-            elif prev["sma_fast"] >= prev["sma_slow"] and fma < sma:
-                cross = "dead"
-
-            pos = broker.state["position"]
-            cash = broker.state["cash"]
-
-            # 生成信号（很简单的示例策略）
-            executed = ""
-            if cross == "golden" and rsi_now >= rsi_buy and cash > trade_notional:
-                ok, msg = broker.buy(price, trade_notional)
-                executed = f"BUY {trade_notional}USDT @ {price} -> {msg}"
-                last_cross = "golden"
-            elif cross == "dead" and rsi_now <= rsi_sell and pos > 0:
-                # 卖掉一半仓位作为示例
-                qty = max(pos * 0.5, 0.0001)
-                ok, msg = broker.sell(price, qty)
-                executed = f"SELL {qty:.6f} @ {price} -> {msg}"
-                last_cross = "dead"
-
-            log(f"price={price:.2f} fma={fma:.2f} sma={sma:.2f} rsi={rsi_now:.1f} "
-                f"pos={pos:.6f} cash={cash:.2f} cross={cross} {executed}")
-
-        except Exception as e:
-            log(f"ERROR: {repr(e)}")
-
-        time.sleep(loop_sec)
+    logging.info("Graceful stop received. Bye.")
 
 if __name__ == "__main__":
     main()
