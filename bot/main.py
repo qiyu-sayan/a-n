@@ -137,6 +137,7 @@ def place_order(symbol: str, side: str, usdt_notional: float):
 # ========= 主流程 =========
 def main():
     log.info("🚀 run start")
+    wechat("▶️ run start")
     log.info(f"SYMBOLS={SYMBOLS}  ENABLE_TRADING={ENABLE_TRADING}  PAPER={PAPER}  ORDER_USDT={ORDER_USDT}")
 
     acted = 0
@@ -148,9 +149,10 @@ def main():
         res = place_order(sym, sig["side"], ORDER_USDT)
         acted += 1
         time.sleep(0.2)
-
+wechat("✅ run end")
     if acted == 0:
         log.info("本次无交易动作（可能无信号或被 451 跳过）。")
+    
     log.info("🏁 run end")
 
 if __name__ == "__main__":
