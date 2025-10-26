@@ -1,0 +1,25 @@
+name: ping-wecom
+
+on:
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  ping:
+    runs-on: self-hosted  # 或 ubuntu-latest
+    steps:
+      - name: Ping WeCom
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          set -e
+          if [ -z "$WECHAT_WEBHOOK" ]; then
+            echo "WECHAT_WEBHOOK is empty. Set it in Repo Settings → Secrets → Actions."
+            exit 1
+          fi
+          http_code=$(curl -sS -o resp.json -w '%{http_code}' \
+            -X POST "$WECHAT_WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d '{"msgtype":"text","text":{"content":"Manual ping from workflow_dispatch (#'"$GITHUB_RUN_NUMBER"' )"}}')
+          echo "HTTP $http_code"
+          cat resp.json
+          grep -q '"errcode":0' resp.json
