@@ -3,3 +3,5 @@ pandas
 numpy
 pyyaml
 pytz
+binance-connector
+python-dotenv

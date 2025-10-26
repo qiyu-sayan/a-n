@@ -2,17 +2,17 @@ name: run-bot
 
 on:
   schedule:
-    - cron: "0 * * * *"
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    - cron: "0 * * * *"   # 每小时整点跑一次
+  workflow_dispatch:      # 允许手动运行
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Shanghai        # 根据需要改你的时区
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -26,19 +26,46 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Prepare logs dir
-        run: mkdir -p logs
-
-      - name: Run main.py and append to daily log
         run: |
-          TS=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          echo "=== ${TS} ===" >> logs/$(date -u +"%Y-%m-%d").log
-          python bot/main.py --config config.yaml >> logs/$(date -u +"%Y-%m-%d").log 2>&1 || true
-          echo "" >> logs/$(date -u +"%Y-%m-%d").log
+          mkdir -p logs
+          echo "START $(date '+%F %T %Z')" > logs/run-${{ github.run_id }}.log
 
-      - name: Commit logs
+      - name: Run bot
+        id: runbot
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add logs/*.log
-          git commit -m "auto commit $(date -u +"%Y-%m-%d %H:%M:%S UTC")" || echo "no changes"
-          git push
+          set -e
+          # 如果你的程序需要 .env 内容，可在这里注入到环境变量（示例）
+          if [ -f .env ]; then
+            export $(grep -v '^#' .env | xargs -d '\n' -I{} echo {})
+          fi
+          python bot/main.py >> logs/run-${{ github.run_id }}.log 2>&1
+
+      - name: Upload full log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-log-${{ github.run_id }}
+          path: logs/run-${{ github.run_id }}.log
+          retention-days: 7
+
+      - name: Notify WeCom on success
+        if: success()
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          TAIL=$(tail -n 60 logs/run-${{ github.run_id }}.log | sed 's/"/\\"/g')
+          MSG="**✅ 运行成功**\n> 仓库：${{ github.repository }}\n> Run ID：${{ github.run_id }}\n> 分支：${{ github.ref_name }}\n> 时间：$(date '+%F %T %Z')\n\n**日志尾部(60行)：**\n\`\`\`\n${TAIL}\n\`\`\`"
+          curl -sS -X POST "${WECHAT_WEBHOOK}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"${MSG}\"}}"
+
+      - name: Notify WeCom on failure
+        if: failure()
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          TAIL=$(tail -n 80 logs/run-${{ github.run_id }}.log | sed 's/"/\\"/g')
+          MSG="**❌ 运行失败**\n> 仓库：${{ github.repository }}\n> Run ID：${{ github.run_id }}\n> 分支：${{ github.ref_name }}\n> 时间：$(date '+%F %T %Z')\n\n**日志尾部(80行)：**\n\`\`\`\n${TAIL}\n\`\`\`"
+          curl -sS -X POST "${WECHAT_WEBHOOK}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"${MSG}\"}}"
