@@ -80,7 +80,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 60) -> list[float]:
         return closes
     except Exception as e:
         logging.warning(f"{symbol} klines error: {e}")
-        return [][]
+        return [],[]
 
 # ----------------- 状态 -----------------
 def load_state() -> Dict[str, Any]:
