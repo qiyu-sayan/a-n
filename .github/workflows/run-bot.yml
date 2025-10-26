@@ -1,13 +1,15 @@
 name: run-bot
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *"  # 每小时整点跑一次
+  workflow_dispatch:          # 手动触发
+  schedule:                   # 每小时自动执行一次
+    - cron: "0 * * * *"       # UTC时间整点（北京时间+8小时，即每小时08分触发）
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    timeout-minutes: 10       # 最多运行10分钟，防止卡住
 
     steps:
       - name: Checkout repo
@@ -18,44 +20,48 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests
 
       - name: Prepare logs dir
         run: mkdir -p logs
 
       - name: Run bot
         env:
+          BINANCE_TESTNET: "1"
+          BINANCE_BASE_URL: "https://testnet.binance.vision/api"
+          SYMBOLS: "BTCUSDT,ETHUSDT"
+          INTERVAL: "1m"
+          FAST: "12"
+          SLOW: "26"
+          RUN_MINUTES: "2"
           BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-          BINANCE_TESTNET: ${{ secrets.BINANCE_TESTNET }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: |
-          python -u bot/main.py --config config.yaml \
-            | tee -a "logs/$(date -u +'%Y-%m-%d').log"
+          echo "=== Run start ==="
+          python -u bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
+          echo "=== Run end ==="
 
-      - name: Upload logs as artifact
-        if: ${{ always() }}
+      - name: Upload full logs as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ github.run_id }}
           path: logs/
 
       - name: Notify WeCom on success
-        if: ${{ success() && env.WECOM_WEBHOOK != '' }}
-        env:
-          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        if: success() && env.WECOM_WEBHOOK != ''
         run: |
-          text="✅ run-bot SUCCESS on $GITHUB_REPOSITORY (run #$GITHUB_RUN_NUMBER)"
-          curl -sS -X POST "$WECOM_WEBHOOK" -H 'Content-Type: application/json' \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"$text\"}}"
+          curl -X POST -H 'Content-Type: application/json' \
+            -d "{\"msgtype\": \"text\", \"text\": {\"content\": \"✅ 成功运行：${{ github.repository }}\nRun ID: ${{ github.run_id }}\nBranch: ${{ github.ref_name }}\"}}" \
+            ${{ env.WECOM_WEBHOOK }}
 
       - name: Notify WeCom on failure
-        if: ${{ failure() && env.WECOM_WEBHOOK != '' }}
-        env:
-          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        if: failure() && env.WECOM_WEBHOOK != ''
         run: |
-          text="❌ run-bot FAILED on $GITHUB_REPOSITORY (run #$GITHUB_RUN_NUMBER)"
-          curl -sS -X POST "$WECOM_WEBHOOK" -H 'Content-Type: application/json' \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"$text\"}}"
+          curl -X POST -H 'Content-Type: application/json' \
+            -d "{\"msgtype\": \"text\", \"text\": {\"content\": \"❌ 运行失败：${{ github.repository }}\nRun ID: ${{ github.run_id }}\nBranch: ${{ github.ref_name }}\"}}" \
+            ${{ env.WECOM_WEBHOOK }}

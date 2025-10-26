@@ -1,207 +1,207 @@
+# bot/main.py
+# -*- coding: utf-8 -*-
+"""
+Minimal Binance bot runner for GitHub Actions
+- Pulls klines via REST
+- Simple SMA strategy (fast vs slow)
+- Testnet/Mainnet switch via env
+- Time-bounded run via RUN_MINUTES
+- WeCom webhook notification (optional)
+
+Env vars (set in GitHub Actions 'env:' or repo Secrets):
+  BINANCE_BASE_URL   (default: https://api.binance.com)       # Testnet -> https://testnet.binance.vision/api
+  BINANCE_TESTNET    ("1" to enable testnet)
+  BINANCE_KEY        (optional, only needed if you place orders; this demo just logs signals)
+  BINANCE_SECRET     (optional)
+  SYMBOLS            (comma separated, default: "BTCUSDT,ETHUSDT")
+  INTERVAL           (default: "1m")
+  FAST               (fast SMA len, default: 12)
+  SLOW               (slow SMA len, default: 26)
+  RUN_MINUTES        (default: 2)
+  WECOM_WEBHOOK      (optional; enterprise wechat robot webhook)
+"""
+
 import os
-import sys
 import time
-import json
-import yaml
-import signal
+import hmac
+import hashlib
 import logging
-import requests
-import subprocess
-from statistics import mean
+import json
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import List, Tuple
 
-from trader import Trader, TraderConfig
+import requests
 
-CONFIG_PATH = os.environ.get("BOT_CONFIG", "config.yaml")
-STATE_PATH  = os.environ.get("BOT_STATE",  "state.json")
+# ---------- ENV & Defaults ----------
+BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "0") == "1"
+BINANCE_BASE_URL = os.getenv(
+    "BINANCE_BASE_URL",
+    "https://testnet.binance.vision/api" if BINANCE_TESTNET else "https://api.binance.com"
+)
+BINANCE_KEY = os.getenv("BINANCE_KEY", "")
+BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")
 
-# ----------------- 基础配置/日志 -----------------
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    cfg.setdefault("dry_run", True)
-    cfg.setdefault("symbols", ["BTCUSDT"])
-    cfg.setdefault("poll_seconds", 60)
-    cfg.setdefault("log_level", "INFO")
-    cfg.setdefault("strategy", {})
-    return cfg
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
+INTERVAL = os.getenv("INTERVAL", "1m")
+FAST = int(os.getenv("FAST", "12"))
+SLOW = int(os.getenv("SLOW", "26"))
 
-def setup_logger(level: str):
-    lvl = getattr(logging, level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=lvl,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+RUN_MINUTES = int(os.getenv("RUN_MINUTES", "2"))
+RUN_END_TS = time.time() + RUN_MINUTES * 60
 
-def get_git_rev() -> str:
+WECOM_WEBHOOK = os.getenv("WECOM_WEBHOOK", "").strip()
+
+# ---------- Logging ----------
+os.makedirs("logs", exist_ok=True)
+log_path = os.path.join("logs", f"{datetime.now(timezone.utc).date()}.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_path, encoding="utf-8")
+    ]
+)
+log = logging.getLogger("bot")
+
+def notify_wecom(text: str) -> None:
+    """Send plain text to WeCom robot if webhook provided."""
+    if not WECOM_WEBHOOK:
+        return
     try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        return out
-    except Exception:
-        return "unknown"
-
-def health_line(cfg: dict):
-    line = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "app": "crypto-bot",
-        "version": get_git_rev(),
-        "mode": "DRY_RUN" if cfg.get("dry_run") else "LIVE",
-        "symbols": cfg.get("symbols"),
-        "poll_seconds": cfg.get("poll_seconds"),
-        "strategy": cfg.get("strategy"),
-    }
-    logging.info(f"HEALTH {json.dumps(line, ensure_ascii=False)}")
-
-class Stopper:
-    def __init__(self):
-        self.stop = False
-        signal.signal(signal.SIGINT, self._sig)
-        signal.signal(signal.SIGTERM, self._sig)
-    def _sig(self, *_):
-        self.stop = True
-
-# ----------------- 行情 -----------------
-BINANCE_BASE = "https://api.binance.com"
-
-def fetch_klines(symbol: str, interval: str, limit: int = 60) -> list[float]:
-    try:
-        r = requests.get(f"{BINANCE_BASE}/api/v3/klines",
-                         params={"symbol": symbol, "interval": interval, "limit": limit},
-                         timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        closes = [float(x[4]) for x in data]
-        return closes
+        payload = {"msgtype": "text", "text": {"content": text[:4000]}}
+        r = requests.post(WECOM_WEBHOOK, json=payload, timeout=10)
+        if r.status_code != 200:
+            log.warning("WeCom push non-200: %s %s", r.status_code, r.text[:200])
     except Exception as e:
-        logging.warning(f"{symbol} klines error: {e}")
-        return [],[]
+        log.warning("WeCom push error: %s", e)
 
-# ----------------- 状态 -----------------
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_PATH):
-        return {}
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+# ---------- Binance REST tiny helpers ----------
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "a-n/gh-actions-bot"})
 
-def save_state(state: Dict[str, Any]):
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_PATH)
+def _get(path: str, params: dict = None, timeout: int = 15):
+    url = BINANCE_BASE_URL.rstrip("/") + path
+    r = SESSION.get(url, params=params or {}, timeout=timeout)
+    # GitHub Actions 451/403 常见，这里明确打日志
+    if r.status_code != 200:
+        log.warning("HTTP %s for %s params=%s body=%s", r.status_code, path, params, r.text[:200])
+        r.raise_for_status()
+    return r.json()
 
-def pos_key(sym: str) -> str:
-    return f"pos::{sym}"
+def get_klines(symbol: str, interval: str, limit: int = 200) -> List[Tuple[float, float]]:
+    """
+    Return list of (close_time, close_price) for given symbol/interval.
+    """
+    data = _get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    closes = [(int(k[6]) / 1000.0, float(k[4])) for k in data]  # close time (s), close price
+    return closes
 
-# ----------------- 策略核心：双均线 + 止盈止损 -----------------
-def sma(values: list[float], n: int) -> float | None:
-    if len(values) < n:
-        return None
-    return mean(values[-n:])
+# ---------- Strategy ----------
+def sma(values: List[float], n: int) -> List[float]:
+    if n <= 0:
+        raise ValueError("SMA window must be > 0")
+    out = []
+    s = 0.0
+    for i, v in enumerate(values):
+        s += v
+        if i >= n:
+            s -= values[i - n]
+        if i >= n - 1:
+            out.append(s / n)
+        else:
+            out.append(float("nan"))
+    return out
 
-def strategy_sma(symbol: str, cfg: dict, state: dict, trader: Trader):
-    sconf = cfg["strategy"]
-    fast = int(sconf.get("fast", 12))
-    slow = int(sconf.get("slow", 26))
-    interval = sconf.get("interval", "1m")
-    qty = float(sconf.get("qty", 0.001))
-    tp_ratio = float(sconf.get("take_profit", 0.03))
-    sl_ratio = float(sconf.get("stop_loss", 0.01))
+def generate_signal(prices: List[float], fast: int, slow: int) -> str:
+    """
+    Returns "BUY", "SELL", or "HOLD" based on fast/slow SMA cross.
+    """
+    if slow <= fast:
+        slow, fast = fast, slow  # ensure slow >= fast
+    if len(prices) < slow + 2:
+        return "HOLD"
 
-    closes = fetch_klines(symbol, interval, limit=max(slow + 3, 60))
-    if len(closes) < slow + 1:
-        logging.info(f"{symbol} wait more candles... ({len(closes)}/{slow+1})")
-        return
+    f = sma(prices, fast)
+    s = sma(prices, slow)
 
-    fast_now = sma(closes, fast)
-    slow_now = sma(closes, slow)
-    fast_prev = sma(closes[:-1], fast)
-    slow_prev = sma(closes[:-1], slow)
-    last = closes[-1]
+    # look at last two bars for cross
+    f1, s1 = f[-1], s[-1]
+    f2, s2 = f[-2], s[-2]
 
-    if fast_now is None or slow_now is None or fast_prev is None or slow_prev is None:
-        return
+    if f2 <= s2 and f1 > s1:
+        return "BUY"
+    if f2 >= s2 and f1 < s1:
+        return "SELL"
+    return "HOLD"
 
-    k = pos_key(symbol)
-    pos = state.get(k)  # None or {side, entry, qty}
+# ---------- (Optional) place order on testnet ----------
+def _sign(params: dict, secret: str) -> str:
+    query = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-    cross_up   = fast_prev <= slow_prev and fast_now >  slow_now
-    cross_down = fast_prev >= slow_prev and fast_now <  slow_now
+def place_testnet_order(symbol: str, side: str, qty: float) -> dict:
+    """
+    Very small example for MARKET order on /api/v3/order (SIGNED).
+    Only if you configured BINANCE_KEY/SECRET and you're on testnet (recommended).
+    """
+    if not BINANCE_KEY or not BINANCE_SECRET:
+        raise RuntimeError("No API key/secret; skip placing order.")
 
-    # 有仓位：浮动止盈/止损（仅对 LONG 示范）
-    if pos and pos["side"] == "LONG":
-        pnl = (last - pos["entry"]) / pos["entry"]
-        if pnl >= tp_ratio:
-            logging.info(f"SIGNAL TAKE_PROFIT {symbol} entry={pos['entry']:.2f} last={last:.2f} pnl={pnl:.4f}")
-            # 市价卖出（真实模式），dry_run 会自动只打印
-            trader.market_order(symbol, "SELL", pos["qty"])
-            state.pop(k, None)
-            save_state(state)
-            return
-        if pnl <= -sl_ratio:
-            logging.info(f"SIGNAL STOP_LOSS  {symbol} entry={pos['entry']:.2f} last={last:.2f} pnl={pnl:.4f}")
-            trader.market_order(symbol, "SELL", pos["qty"])
-            state.pop(k, None)
-            save_state(state)
-            return
+    ts = int(time.time() * 1000)
+    params = {
+        "symbol": symbol,
+        "side": side.upper(),
+        "type": "MARKET",
+        "quantity": qty,          # NOTE: must fit testnet lot size; this is demo only
+        "timestamp": ts
+    }
+    params["signature"] = _sign(params, BINANCE_SECRET)
+    url = BINANCE_BASE_URL.rstrip("/") + "/api/v3/order"
+    headers = {"X-MBX-APIKEY": BINANCE_KEY}
+    r = SESSION.post(url, headers=headers, params=params, timeout=15)
+    if r.status_code != 200:
+        log.warning("Order HTTP %s: %s", r.status_code, r.text[:200])
+        r.raise_for_status()
+    return r.json()
 
-    # 无仓：看金叉做多（示范 LONG；做空现货需用合约/杠杆，本文不展开）
-    if not pos and cross_up:
-        state[k] = {"side": "LONG", "entry": last, "qty": qty}
-        save_state(state)
-        logging.info(f"SIGNAL BUY {symbol} entry={last:.2f} fast={fast_now:.2f} slow={slow_now:.2f}")
-        trader.market_order(symbol, "BUY", qty)
-        # 如需在现货上用 OCO（一次挂出止盈+止损），示例：
-        # tp = round(last * (1 + tp_ratio), 2)
-        # sp = round(last * (1 - sl_ratio), 2)
-        # sl = round(last * (1 - sl_ratio * 1.002), 2)  # stopLimit 比 stopPrice 略低一点
-        # trader.oco(symbol, qty, take_profit_price=tp, stop_price=sp, stop_limit_price=sl)
-        return
-
-    logging.info(f"PRICE {symbol}={last:.2f} fast={fast_now:.2f} slow={slow_now:.2f} {'HOLD' if pos else 'FLAT'}")
-
-# ----------------- 主循环 -----------------
+# ---------- Main loop (time-bounded) ----------
 def main():
-    cfg = load_config(CONFIG_PATH)
-    setup_logger(cfg["log_level"])
-    health_line(cfg)
+    start_msg = f"START {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n" \
+                f"symbols={SYMBOLS} interval={INTERVAL} fast={FAST} slow={SLOW}\n" \
+                f"base_url={BINANCE_BASE_URL} testnet={BINANCE_TESTNET}"
+    log.info(start_msg)
+    notify_wecom(f"[a-n] Bot start\n{start_msg}")
 
-    trader = Trader(TraderConfig(
-        dry_run=bool(cfg.get("dry_run", True)),
-        testnet=(os.getenv("BINANCE_TESTNET", "1") == "1")
-    ))
-
-    stopper = Stopper()
-    interval = max(30, int(cfg["poll_seconds"]))
-    symbols = list(cfg["symbols"])
-
-    if cfg.get("strategy", {}).get("type", "sma").lower() != "sma":
-        logging.error("仅内置 strategy.type=sma")
-        sys.exit(1)
-
-    state = load_state()
-    logging.info(f"Start loop: symbols={symbols}, interval={interval}s, dry_run={cfg.get('dry_run', True)}, strategy=sma")
-
-    while not stopper.stop:
-        start = time.time()
-        for sym in symbols:
+    while time.time() < RUN_END_TS:
+        for sym in SYMBOLS:
             try:
-                strategy_sma(sym, cfg, state, trader)
-            except Exception as e:
-                logging.warning(f"{sym} strategy error: {e}")
-        health_line(cfg)
-        elapsed = time.time() - start
-        time.sleep(max(0.0, interval - elapsed))
+                kl = get_klines(sym, INTERVAL, limit=max(200, SLOW + 5))
+                closes = [p for _, p in kl]
+                signal = generate_signal(closes, FAST, SLOW)
+                last_price = closes[-1] if closes else float("nan")
+                log.info("symbol=%s price=%.6f signal=%s", sym, last_price, signal)
 
-    logging.info("Graceful stop received. Bye.")
+                # Demo: 仅在 Testnet、且提供了 key/secret 时，尝试下单（非常小的 quantity；可能因精度失败）
+                # 实盘请自己处理风控与数量精度，这里只是示例。
+                # if BINANCE_TESTNET and BINANCE_KEY and BINANCE_SECRET and signal in ("BUY", "SELL"):
+                #     side = "BUY" if signal == "BUY" else "SELL"
+                #     resp = place_testnet_order(sym, side, qty=0.001)
+                #     log.info("order resp: %s", json.dumps(resp)[:200])
+
+            except requests.HTTPError as he:
+                # 451/403/429 等在此都会被记录
+                log.warning("HTTP error for %s: %s", sym, he)
+            except Exception as e:
+                log.warning("Error for %s: %s", sym, e)
+
+        # 小睡一会，避免频繁请求
+        time.sleep(5)
+
+    done_msg = f"DONE {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    log.info(done_msg)
+    notify_wecom(f"[a-n] Bot finished\n{done_msg}")
 
 if __name__ == "__main__":
     main()
