@@ -1,16 +1,14 @@
 name: run-bot
 
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 * * * *"   # 每小时整点跑一次
-  workflow_dispatch:      # 允许手动运行
+    - cron: "13 * * * *"  # 每小时第13分钟跑一次，可改
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      PYTHONUNBUFFERED: "1"
-      TZ: Asia/Shanghai        # 根据需要改你的时区
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -26,46 +24,38 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Prepare logs dir
-        run: |
-          mkdir -p logs
-          echo "START $(date '+%F %T %Z')" > logs/run-${{ github.run_id }}.log
+        run: mkdir -p logs
 
+      # 方式A：直接用 Secrets 注入为环境变量，脚本里用 os.getenv 读取（推荐）
       - name: Run bot
-        id: runbot
+        env:
+          BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
+          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+          BINANCE_TESTNET: ${{ secrets.BINANCE_TESTNET }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: |
           set -e
-          # 如果你的程序需要 .env 内容，可在这里注入到环境变量（示例）
-          if [ -f .env ]; then
-            export $(grep -v '^#' .env | xargs -d '\n' -I{} echo {})
-          fi
           python bot/main.py >> logs/run-${{ github.run_id }}.log 2>&1
 
-      - name: Upload full log as artifact
+      - name: Upload full logs as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bot-log-${{ github.run_id }}
-          path: logs/run-${{ github.run_id }}.log
-          retention-days: 7
+          name: logs-${{ github.run_id }}
+          path: logs/
 
       - name: Notify WeCom on success
-        if: success()
-        env:
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        if: success() && secrets.WECOM_WEBHOOK != ''
         run: |
-          TAIL=$(tail -n 60 logs/run-${{ github.run_id }}.log | sed 's/"/\\"/g')
-          MSG="**✅ 运行成功**\n> 仓库：${{ github.repository }}\n> Run ID：${{ github.run_id }}\n> 分支：${{ github.ref_name }}\n> 时间：$(date '+%F %T %Z')\n\n**日志尾部(60行)：**\n\`\`\`\n${TAIL}\n\`\`\`"
-          curl -sS -X POST "${WECHAT_WEBHOOK}" \
+          curl -sS -X POST \
             -H 'Content-Type: application/json' \
-            -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"${MSG}\"}}"
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"✅ Bot run SUCCESS (#${{ github.run_number }})\"}}" \
+            "${{ secrets.WECOM_WEBHOOK }}"
 
       - name: Notify WeCom on failure
-        if: failure()
-        env:
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        if: failure() && secrets.WECOM_WEBHOOK != ''
         run: |
-          TAIL=$(tail -n 80 logs/run-${{ github.run_id }}.log | sed 's/"/\\"/g')
-          MSG="**❌ 运行失败**\n> 仓库：${{ github.repository }}\n> Run ID：${{ github.run_id }}\n> 分支：${{ github.ref_name }}\n> 时间：$(date '+%F %T %Z')\n\n**日志尾部(80行)：**\n\`\`\`\n${TAIL}\n\`\`\`"
-          curl -sS -X POST "${WECHAT_WEBHOOK}" \
+          curl -sS -X POST \
             -H 'Content-Type: application/json' \
-            -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"${MSG}\"}}"
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"❌ Bot run FAILED (#${{ github.run_number }}). 请到 Actions 查看日志。\"}}" \
+            "${{ secrets.WECOM_WEBHOOK }}"
