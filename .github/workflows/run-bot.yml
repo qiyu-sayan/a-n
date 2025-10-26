@@ -39,7 +39,7 @@ jobs:
           RUN_MINUTES: "2"
           BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK_ }}
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         run: |
           echo "=== Run start ==="
           python -u bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
