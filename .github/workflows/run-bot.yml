@@ -2,14 +2,13 @@ name: run-bot
 
 on:
   workflow_dispatch:          # 手动触发
-  schedule:                   # 每小时自动执行一次
-    - cron: "0 * * * *"       # UTC时间整点（北京时间+8小时，即每小时08分触发）
+  schedule:                   # 每小时自动执行一次（UTC整点；北京=+8h）
+    - cron: "0 * * * *"
 
 jobs:
   run:
-    runs-on: ubuntu-latest
-
-    timeout-minutes: 10       # 最多运行10分钟，防止卡住
+    runs-on: self-hosted      # 使用你已部署的 Vultr 自托管 runner
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repo
@@ -23,45 +22,53 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests python-dotenv binance-connector
 
       - name: Prepare logs dir
         run: mkdir -p logs
 
+      # 同 Job 内先测一条 WeCom（用与主程序相同的 env），确保通路无误
+      - name: Test WeCom webhook (ping before run)
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          WECOM_WEBHOOK:  ${{ secrets.WECHAT_WEBHOOK }}   # 兼容变量名
+        run: |
+          set -e
+          TARGET="${WECHAT_WEBHOOK:-$WECOM_WEBHOOK}"
+          if [ -z "$TARGET" ]; then
+            echo "WECHAT_WEBHOOK is empty. Set it in Settings → Secrets → Actions."
+            exit 1
+          fi
+          http_code=$(curl -sS -o resp.json -w '%{http_code}' \
+            -X POST "$TARGET" -H 'Content-Type: application/json' \
+            -d '{"msgtype":"text","text":{"content":"Ping BEFORE run #'"$GITHUB_RUN_NUMBER"'"}}')
+          echo "HTTP $http_code"
+          cat resp.json
+          grep -q '"errcode":0' resp.json
+
       - name: Run bot
         env:
-          BINANCE_TESTNET: "1"
-          BINANCE_BASE_URL: "https://testnet.binance.vision/api"
+          # 交易/运行相关
+          BINANCE_TESTNET: "1"              # 测试网更稳（主网可能451）
           SYMBOLS: "BTCUSDT,ETHUSDT"
           INTERVAL: "1m"
           FAST: "12"
           SLOW: "26"
           RUN_MINUTES: "2"
+          ENABLE_TRADING: "0"               # 默认禁用真交易
+          PAPER: "1"                        # 默认纸交易
+          ORDER_USDT: "10"
           BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+          # 推送（两个变量名都注入，代码双兼容）
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          WECOM_WEBHOOK:  ${{ secrets.WECHAT_WEBHOOK }}
         run: |
-          echo "=== Run start ==="
           python -u bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
-          echo "=== Run end ==="
 
-      - name: Upload full logs as artifact
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ github.run_id }}
           path: logs/
-
-      - name: Notify WeCom on success
-        if: success() && env.WECOM_WEBHOOK != ''
-        run: |
-          curl -X POST -H 'Content-Type: application/json' \
-            -d "{\"msgtype\": \"text\", \"text\": {\"content\": \"✅ 成功运行：${{ github.repository }}\nRun ID: ${{ github.run_id }}\nBranch: ${{ github.ref_name }}\"}}" \
-            ${{ env.WECOM_WEBHOOK }}
-
-      - name: Notify WeCom on failure
-        if: failure() && env.WECOM_WEBHOOK != ''
-        run: |
-          curl -X POST -H 'Content-Type: application/json' \
-            -d "{\"msgtype\": \"text\", \"text\": {\"content\": \"❌ 运行失败：${{ github.repository }}\nRun ID: ${{ github.run_id }}\nBranch: ${{ github.ref_name }}\"}}" \
-            ${{ env.WECOM_WEBHOOK }}
