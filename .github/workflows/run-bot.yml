@@ -66,8 +66,5 @@ jobs:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           JOB_STATUS: ${{ job.status }}
         run: |
-          TAIL="$( (tail -n 60 logs/*.log 2>/dev/null) || echo 'no log file' )"
-          MSG="Run #${GITHUB_RUN_NUMBER} status: ${JOB_STATUS}
----- LOG TAIL ----
-${TAIL}"
-          python -u .github/wecom_notify.py "$WECHAT_WEBHOOK" "$MSG"
+  MSG="xxx"
+  python -u .github/wecom_notify.py "$WECHAT_WEBHOOK" "$MSG"
