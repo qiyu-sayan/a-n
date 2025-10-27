@@ -3,68 +3,68 @@ name: run-bot
 on:
 workflow_dispatch:
 schedule:
-  - cron: "0 * * * *"  # 每小时跑一次
+- cron: "0 * * * *"  # 每小时跑一次
 
 jobs:
 run:
-  runs-on: self-hosted
-  timeout-minutes: 12
+runs-on: self-hosted
+timeout-minutes: 12
 
-  steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
+steps:
+  - name: Checkout repo
+    uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.10"
+  - name: Set up Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.10"
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install requests python-dotenv binance-connector
+  - name: Install dependencies
+    run: |
+      python -m pip install --upgrade pip
+      pip install requests python-dotenv binance-connector
 
-    - name: Prepare logs dir
-      run: mkdir -p logs
+  - name: Prepare logs dir
+    run: mkdir -p logs
 
-    - name: Notify WeCom BEFORE run
-      if: ${{ secrets.WECHAT_WEBHOOK != '' }}
-      env:
-        WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-      run: |
-        MSG="Ping BEFORE run #${GITHUB_RUN_NUMBER}"
-        python -u .github/wecom_notify.py "$WECHAT_WEBHOOK" "$MSG"
+  - name: Notify WeCom BEFORE run
+    if: ${{ secrets.WECHAT_WEBHOOK != '' }}
+    env:
+      WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+    run: |
+      MSG="Ping BEFORE run #${GITHUB_RUN_NUMBER}"
+      python -u .github/wecom_notify.py "$WECHAT_WEBHOOK" "$MSG"
 
-    - name: Run bot
-      env:
-        BINANCE_TESTNET: "1"
-        SYMBOLS: "BTCUSDT,ETHUSDT"
-        INTERVAL: "1m"
-        FAST: "12"
-        SLOW: "26"
-        RUN_MINUTES: "2"
-        ENABLE_TRADING: "0"
-        PAPER: "1"
-        ORDER_USDT: "10"
-        BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
-        BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-        WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-      run: |
-        set -euo pipefail
-        python -u bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
+  - name: Run bot
+    env:
+      BINANCE_TESTNET: "1"
+      SYMBOLS: "BTCUSDT,ETHUSDT"
+      INTERVAL: "1m"
+      FAST: "12"
+      SLOW: "26"
+      RUN_MINUTES: "2"
+      ENABLE_TRADING: "0"
+      PAPER: "1"
+      ORDER_USDT: "10"
+      BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
+      BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+      WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+    run: |
+      set -euo pipefail
+      python -u bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
 
-    - name: Upload logs
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: logs-${{ github.run_id }}
-        path: logs/
+  - name: Upload logs
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: logs-${{ github.run_id }}
+      path: logs/
 
-    - name: Notify WeCom AFTER run
-      if: always() && ${{ secrets.WECHAT_WEBHOOK != '' }}
-      env:
-        WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-        JOB_STATUS: ${{ job.status }}
-      run: |
+  - name: Notify WeCom AFTER run
+    if: always() && ${{ secrets.WECHAT_WEBHOOK != '' }}
+    env:
+      WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+      JOB_STATUS: ${{ job.status }}
+    run: |
 MSG="xxx"
 python -u .github/wecom_notify.py "$WECHAT_WEBHOOK" "$MSG"
