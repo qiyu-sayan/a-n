@@ -3,7 +3,7 @@ name: run-bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"  # 每小时
 
 jobs:
   run:
@@ -27,18 +27,14 @@ jobs:
       - name: Prepare logs dir
         run: mkdir -p logs
 
-      - name: Test WeCom webhook (ping before run)
+      - name: Ping WeCom BEFORE run
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-          WECOM_WEBHOOK:  ${{ secrets.WECHAT_WEBHOOK }}
+        shell: bash
         run: |
-          set -e
-          HOOK="${WECHAT_WEBHOOK:-$WECOM_WEBHOOK}"
-          if [ -z "$HOOK" ]; then
-            echo "WECHAT_WEBHOOK is empty" && exit 1
-          fi
-          curl -sS -X POST "$HOOK" -H 'Content-Type: application/json' \
-            -d '{"msgtype":"text","text":{"content":"Ping BEFORE run #'"$GITHUB_RUN_NUMBER"'"}}' >/dev/null
+          [ -z "$WECHAT_WEBHOOK" ] && { echo "WECHAT_WEBHOOK empty"; exit 1; }
+          curl -sS -X POST "$WECHAT_WEBHOOK" -H 'Content-Type: application/json' \
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"Ping BEFORE run #${GITHUB_RUN_NUMBER}\"}}" >/dev/null
 
       - name: Run bot
         env:
@@ -54,7 +50,7 @@ jobs:
           BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-          WECOM_WEBHOOK:  ${{ secrets.WECHAT_WEBHOOK }}
+        shell: bash
         run: |
           set -euo pipefail
           python -u bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
@@ -66,23 +62,27 @@ jobs:
           name: logs-${{ github.run_id }}
           path: logs/
 
-      # ★ 新增：无论成功失败，都把结果和日志尾部推到企微
       - name: Notify WeCom with job result
         if: always()
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-          WECOM_WEBHOOK:  ${{ secrets.WECHAT_WEBHOOK }}
           JOB_STATUS: ${{ job.status }}
+        shell: bash
         run: |
-          HOOK="${WECHAT_WEBHOOK:-$WECOM_WEBHOOK}"
-          [ -z "$HOOK" ] && exit 0
+          [ -z "$WECHAT_WEBHOOK" ] && exit 0
           TAIL="$( (tail -n 60 logs/*.log 2>/dev/null) || echo 'no log file' )"
-          # 简化/截断，避免超过企微长度
           MSG="Run #${GITHUB_RUN_NUMBER} status: ${JOB_STATUS}\n---- LOG TAIL ----\n${TAIL}"
-          # 转义双引号
-          MSG_ESC=$(printf "%s" "$MSG" | python - <<'PY'
-import sys,json; print(json.dumps({"t":sys.stdin.read()})["t"])
+          # 用 python 发送，避免 YAML/JSON 引号地狱
+          python - "$WECHAT_WEBHOOK" << 'PY'
+import json, sys, urllib.request
+hook = sys.argv[1]
+msg  = sys.stdin.read()
+payload = {"msgtype":"text","text":{"content": msg[:1900]}}
+data = json.dumps(payload).encode("utf-8")
+req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        print("WeCom:", r.status)
+except Exception as e:
+    print("WeCom error:", e)
 PY
-)
-          curl -sS -X POST "$HOOK" -H 'Content-Type: application/json' \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${MSG_ESC[:1900]}\"}}" >/dev/null
