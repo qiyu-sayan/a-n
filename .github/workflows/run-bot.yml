@@ -27,14 +27,13 @@ jobs:
       - name: Prepare logs dir
         run: mkdir -p logs
 
-      - name: Ping WeCom BEFORE run
+      - name: Notify WeCom BEFORE run
         if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-        shell: bash
         run: |
-          curl -sS -X POST "$WECHAT_WEBHOOK" -H 'Content-Type: application/json' \
-            --data-raw "{\"msgtype\":\"text\",\"text\":{\"content\":\"Ping BEFORE run #${GITHUB_RUN_NUMBER}\"}}" >/dev/null
+          MSG="Ping BEFORE run #${GITHUB_RUN_NUMBER}"
+          python -u .github/wecom_notify.py "$WECHAT_WEBHOOK" "$MSG"
 
       - name: Run bot
         env:
@@ -50,7 +49,6 @@ jobs:
           BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-        shell: bash
         run: |
           set -euo pipefail
           python -u bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
@@ -62,33 +60,14 @@ jobs:
           name: logs-${{ github.run_id }}
           path: logs/
 
-      - name: Notify WeCom with job result
+      - name: Notify WeCom AFTER run
         if: always() && ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           JOB_STATUS: ${{ job.status }}
-        shell: bash
         run: |
-          # 组装消息文本
           TAIL="$( (tail -n 60 logs/*.log 2>/dev/null) || echo 'no log file' )"
           MSG="Run #${GITHUB_RUN_NUMBER} status: ${JOB_STATUS}
 ---- LOG TAIL ----
 ${TAIL}"
-          # 放到环境变量里，避免 YAML/引号陷阱
-          export MSG_CONTENT="$MSG"
-          # 用 Python 读取 MSG_CONTENT 并发送
-          python - <<'PY'
-import json, os, sys, urllib.request
-hook = os.environ.get("WECHAT_WEBHOOK")
-msg  = os.environ.get("MSG_CONTENT") or ""
-if not hook:
-    sys.exit(0)
-payload = {"msgtype":"text","text":{"content": msg[:1900]}}
-data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
-try:
-    with urllib.request.urlopen(req, timeout=10) as r:
-        print("WeCom:", r.status)
-except Exception as e:
-    print("WeCom error:", e)
-PY
+          python -u .github/wecom_notify.py "$WECHAT_WEBHOOK" "$MSG"
