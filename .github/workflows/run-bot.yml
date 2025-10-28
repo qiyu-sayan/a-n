@@ -40,7 +40,11 @@ jobs:
           path: logs
 
       - name: Notify WeCom
+<<<<<<< Updated upstream
         if: ${{ always() && (secrets.WECHAT_WEBHOOK != '') }}
+=======
+        if: always()
+>>>>>>> Stashed changes
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           JOB_STATUS: ${{ job.status }}
