@@ -2,7 +2,7 @@ name: run-bot
 
 on:
   schedule:
-    - cron: "5 * * * *"   # 每小时第5分钟跑一次；需要改频率再说
+    - cron: "5 * * * *"   # 每小时第5分钟跑一次
   workflow_dispatch:
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
           path: logs
 
       - name: Notify WeCom
-        if: always() && secrets.WECHAT_WEBHOOK != ''
+        if: ${{ always() && secrets.WECHAT_WEBHOOK != '' }}
         env:
           HOOK: ${{ secrets.WECHAT_WEBHOOK }}
           STATUS: ${{ job.status }}
