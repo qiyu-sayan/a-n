@@ -40,13 +40,13 @@ jobs:
           path: logs
 
       - name: Notify WeCom
-        if: ${{ always() && secrets.WECHAT_WEBHOOK != '' }}
+        if: ${{ always() && (secrets.WECHAT_WEBHOOK != '') }}
         env:
-          HOOK: ${{ secrets.WECHAT_WEBHOOK }}
-          STATUS: ${{ job.status }}
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          JOB_STATUS: ${{ job.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          MSG="Run #${GITHUB_RUN_NUMBER} - ${STATUS}\n${RUN_URL}"
-          curl -sS -X POST "$HOOK" \
+          MSG="Run #${GITHUB_RUN_NUMBER} - ${JOB_STATUS}\n${RUN_URL}"
+          curl -sS -X POST "$WECHAT_WEBHOOK" \
             -H "Content-Type: application/json" \
             -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${MSG}\"}}"
