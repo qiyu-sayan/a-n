@@ -1,0 +1,86 @@
+name: train-and-update
+
+on:
+  schedule:
+    - cron: '15 */2 * * *'   # 每 2 小时的 :15 分自动训练
+  workflow_dispatch:        # 也支持手动触发
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # 需要完整历史用于提交
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          # 兜底，确保回测脚本依赖齐全
+          pip install pandas numpy requests
+
+      - name: Ping BEFORE
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          MSG="Train start #${{ github.run_number }} on ${{ github.ref_name }}"
+          curl -sS -X POST "$WECHAT_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${MSG}\"}}"
+
+      - name: Run trainer
+        id: run_trainer
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p logs
+          python tools/train_and_update.py 2>&1 | tee -a "logs/train_$(date -u +'%Y-%m-%d').log"
+
+      - name: Commit & Push updated params
+        id: commit
+        run: |
+          if ! git diff --quiet; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add config/params.json
+            git commit -m "chore: trainer auto-update params ($(date -u +'%Y-%m-%dT%H:%MZ'))"
+            git push
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload train logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: train_logs_${{ github.run_id }}
+          path: logs/
+
+      - name: Notify AFTER
+        if: ${{ always() && secrets.WECHAT_WEBHOOK != '' }}
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "${{ steps.commit.outputs.changed }}" = "true" ]; then
+            TAIL="✅ params.json updated"
+          else
+            TAIL="ℹ️ no change"
+          fi
+          MSG="Train #${{ github.run_number }} - ${STATUS}\n${RUN_URL}\n${TAIL}"
+          curl -sS -X POST "$WECHAT_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${MSG}\"}}"
