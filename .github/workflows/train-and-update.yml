@@ -2,8 +2,11 @@ name: train-and-update
 
 on:
   schedule:
-    - cron: '15 */2 * * *'   # 每 2 小时的 :15 分自动训练
-  workflow_dispatch:        # 也支持手动触发
+    - cron: "10 */6 * * *"      # 每 6 小时训练一次（按需改）
+  workflow_dispatch:
+
+permissions:
+  contents: write              # 允许推回仓库
 
 jobs:
   train:
@@ -12,75 +15,53 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0    # 需要完整历史用于提交
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          # 兜底，确保回测脚本依赖齐全
-          pip install pandas numpy requests
+          pip install -r requirements.txt || true
+          pip install requests pandas numpy ta
 
-      - name: Ping BEFORE
+      - name: Run training
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          python tools/train_and_update.py
+
+      - name: Commit updated params.json
+        run: |
+          git config user.name  "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add config/params.json || true
+          git diff --quiet --exit-code config/params.json && echo "No param changes." && exit 0
+          git commit -m "chore: update params.json by auto-trainer"
+          git push
+
+      # 训练完成后把新参数快照发到企业微信
+      - name: Notify WeCom new params
         if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         run: |
-          MSG="Train start #${{ github.run_number }} on ${{ github.ref_name }}"
-          curl -sS -X POST "$WECHAT_WEBHOOK" \
-            -H "Content-Type: application/json" \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${MSG}\"}}"
-
-      - name: Run trainer
-        id: run_trainer
-        env:
-          GITHUB_SHA: ${{ github.sha }}
-        run: |
-          mkdir -p logs
-          python tools/train_and_update.py 2>&1 | tee -a "logs/train_$(date -u +'%Y-%m-%d').log"
-
-      - name: Commit & Push updated params
-        id: commit
-        run: |
-          if ! git diff --quiet; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add config/params.json
-            git commit -m "chore: trainer auto-update params ($(date -u +'%Y-%m-%dT%H:%MZ'))"
-            git push
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload train logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: train_logs_${{ github.run_id }}
-          path: logs/
-
-      - name: Notify AFTER
-        if: ${{ always() && secrets.WECHAT_WEBHOOK != '' }}
-        env:
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          STATUS="${{ job.status }}"
-          if [ "${{ steps.commit.outputs.changed }}" = "true" ]; then
-            TAIL="✅ params.json updated"
-          else
-            TAIL="ℹ️ no change"
-          fi
-          MSG="Train #${{ github.run_number }} - ${STATUS}\n${RUN_URL}\n${TAIL}"
-          curl -sS -X POST "$WECHAT_WEBHOOK" \
-            -H "Content-Type: application/json" \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${MSG}\"}}"
+          python - <<'PY'
+          import json, os, urllib.request
+          hook = os.environ.get('WECHAT_WEBHOOK')
+          try:
+            with open('config/params.json','r',encoding='utf-8') as f:
+              params = json.load(f)
+          except Exception as e:
+            params = {"error": f"load params.json failed: {e}"}
+          msg = "✅ 训练完成，已更新参数\n" + json.dumps(params, ensure_ascii=False)
+          data = json.dumps({"msgtype":"text","text":{"content": msg}}).encode()
+          req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  print("WeCom:", r.status)
+          except Exception as e:
+              print("WeCom error:", e)
+          PY
