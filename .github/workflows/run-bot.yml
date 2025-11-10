@@ -2,7 +2,7 @@ name: run-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"       # 每 5 分钟一次（按需改）
+    - cron: "*/5 * * * *"        # 每 5 分钟一次（按需改）
   workflow_dispatch:
 
 jobs:
@@ -21,32 +21,37 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
           pip install requests
 
-      # 在每次运行前推送当前参数快照
-      - name: Push current params snapshot
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
+      # 运行前把当前参数发一条（仅当设置了 WECHAT_WEBHOOK）
+      - name: Notify WeCom BEFORE run (params snapshot)
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         run: |
-          python - <<'PY'
-          import json, os, urllib.request
-          hook = os.environ.get('WECHAT_WEBHOOK')
-          try:
-            with open('config/params.json','r',encoding='utf-8') as f:
-              params = json.load(f)
-          except Exception as e:
-            params = {"error": f"load params.json failed: {e}"}
-          msg = "🧩 当前策略参数\n" + json.dumps(params, ensure_ascii=False)
-          data = json.dumps({"msgtype":"text","text":{"content": msg}}).encode()
-          req = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
-          try:
-              with urllib.request.urlopen(req, timeout=10) as r:
-                  print("WeCom:", r.status)
-          except Exception as e:
-              print("WeCom error:", e)
-          PY
+          if [ -n "${WECHAT_WEBHOOK}" ]; then
+            python - <<'PY'
+            import json, os, urllib.request
+            hook = os.environ.get('WECHAT_WEBHOOK')
+            try:
+              with open('config/params.json','r',encoding='utf-8') as f:
+                params = json.load(f)
+            except Exception as e:
+              params = {"error": f"load params.json failed: {e}"}
+            msg = "🧩 当前策略参数\n" + json.dumps(params, ensure_ascii=False)
+            data = json.dumps({"msgtype":"text","text":{"content": msg}}).encode()
+            req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    print("WeCom:", r.status)
+            except Exception as e:
+                print("WeCom error:", e)
+            PY
+          else
+            echo "WECHAT_WEBHOOK is empty; skip BEFORE notification."
+          fi
 
       - name: Run trading bot
         env:
@@ -55,23 +60,34 @@ jobs:
           BINANCE_TESTNET: ${{ secrets.BINANCE_TESTNET }}
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         run: |
-          python bot/main.py
+          mkdir -p logs
+          python bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
 
-      # 运行后推送简要结果（可选）
+      # 运行后发一条简要状态（仅当设置了 WECHAT_WEBHOOK）
       - name: Notify WeCom AFTER run
-        if: ${{ always() && secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         run: |
-          python - <<'PY'
-          import json, os, urllib.request
-          hook = os.environ.get('WECHAT_WEBHOOK')
-          msg  = f"Run #{os.environ.get('GITHUB_RUN_NUMBER')} - {os.environ.get('GITHUB_JOB','run')} finished"
-          data = json.dumps({"msgtype":"text","text":{"content": msg}}).encode()
-          req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
-          try:
-              with urllib.request.urlopen(req, timeout=10) as r:
-                  print("WeCom:", r.status)
-          except Exception as e:
-              print("WeCom error:", e)
-          PY
+          if [ -n "${WECHAT_WEBHOOK}" ]; then
+            python - <<'PY'
+            import json, os, urllib.request
+            hook = os.environ.get('WECHAT_WEBHOOK')
+            msg  = f"Run #{os.environ.get('GITHUB_RUN_NUMBER')} finished: {os.environ.get('GITHUB_JOB','run')}"
+            data = json.dumps({"msgtype":"text","text":{"content": msg}}).encode()
+            req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    print("WeCom:", r.status)
+            except Exception as e:
+                print("WeCom error:", e)
+            PY
+          else
+            echo "WECHAT_WEBHOOK is empty; skip AFTER notification."
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs_${{ github.run_id }}
+          path: logs
