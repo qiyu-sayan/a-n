@@ -61,7 +61,6 @@ jobs:
             Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python .github/scripts/wecom_notify.py
-
       # —— 上传日志（可选） ——
       - name: Upload logs
         if: always()
