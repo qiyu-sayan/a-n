@@ -1,0 +1,28 @@
+# --- 全局换行规则 ---------------------------------------------------
+# 默认所有文本文件统一使用 LF（Linux / macOS 换行符）
+*           text=auto eol=lf
+
+# --- 常见脚本与配置文件 ---------------------------------------------
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+
+# --- Windows 专用脚本保持 CRLF --------------------------------------
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# --- 二进制文件，不进行任何换行转换 ---------------------------------
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.pdf       binary
+*.zip       binary
+*.gz        binary
+*.exe       binary
+*.dll       binary
