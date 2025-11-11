@@ -1,31 +1,12 @@
 {
-  "mode": "paper",                          // "live" 表示实盘，"paper" 表示纸交易
-  "symbols": ["BTCUSDT", "ETHUSDT"],        // 可交易多个币对
-  "interval": "1m",                         // K线周期，可改 "5m" / "15m" / "1h"
-  "order_usdt": 10,                         // 每次买入的 USDT 金额
-
-  "strategy": "sma_rsi",                    // 当前策略，可选 "sma_rsi" 或 "mean_revert"
-  "params": {
-    "sma_fast": 12,                         // 快速均线周期
-    "sma_slow": 26,                         // 慢速均线周期
-    "rsi_len": 14,                          // RSI 长度
-    "rsi_buy_below": 55,                    // RSI 低于该值时允许买入
-    "rsi_sell_above": 45                    // RSI 高于该值时允许卖出
-  },
-
-  "risk": {
-    "fee_rate": 0.0004,                     // 手续费假设
-    "slippage": 0.0002,                     // 滑点假设
-    "max_drawdown_cap": 0.12,               // 最大允许回撤
-    "stop_loss_pct": 0.02,                  // 单次止损 2%
-    "take_profit_pct": 0.04                 // 单次止盈 4%
-  },
-
-  "trainer": {
-    "lookback_hours": 72,                   // 训练时使用过去多少小时的数据
-    "retrain_if_7d_pnl_below": -0.03,       // 最近7天收益低于 -3% 触发重训
-    "retrain_if_dd_over": 0.08,             // 最近回撤超过 8% 触发重训
-    "objective": "sortino",                 // 优化目标（sortino / sharpe / pnl）
-    "min_improve_pct": 0.02                 // 新参数至少提升2%才覆盖
+  "SYMBOLS": ["BTCUSDT", "ETHUSDT"],
+  "ORDER_USDT": 10,
+  "PAPER": true,
+  "ENABLE_TRADING": false,
+  "STRATEGY": {
+    "type": "ma_cross",
+    "fast": 12,
+    "slow": 26,
+    "qty": 0.001
   }
 }

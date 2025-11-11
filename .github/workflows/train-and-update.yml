@@ -2,11 +2,11 @@ name: train-and-update
 
 on:
   schedule:
-    - cron: "10 */6 * * *"       # 每 6 小时一次（按需改）
+    - cron: "0 */6 * * *"  # 每6小时运行一次
   workflow_dispatch:
 
 permissions:
-  contents: write                # 允许推回仓库
+  contents: write  # 训练后自动提交变更
 
 jobs:
   train:
@@ -24,52 +24,46 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          pip install requests pandas numpy ta
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run training
+      # —— 在训练前校验 JSON ——（避免 JSONDecodeError）
+      - name: Validate params.json
+        run: |
+          python -c "import json,sys;json.load(open('config/params.json','rb'));print('params.json OK')"
+
+      # —— 训练前推送 —— 
+      - name: Notify WeCom BEFORE training
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          MSG: |
+            Training start #${{ github.run_number }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
         run: |
-          python tools/train_and_update.py
+          python .github/scripts/wecom_notify.py
 
+      # —— 执行训练/回测 ——（按你实际脚本路径）
+      - name: Run training
+        run: |
+          python trainer/train.py
+
+      # —— 提交参数或模型等产物 ——（按你需要选择路径）
       - name: Commit updated params.json
         run: |
-          if git diff --quiet --exit-code config/params.json 2>/dev/null; then
-            echo "No param changes."
-          else
-            git config user.name  "bot"
-            git config user.email "bot@users.noreply.github.com"
-            git add config/params.json
-            git commit -m "chore: update params.json by auto-trainer"
-            git push
-          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/params.json || true
+          git commit -m "chore: update params via training #${{ github.run_number }}" || echo "nothing to commit"
+          git push
 
-      # 训练完成后把新参数快照发到企业微信（仅当设置了 WECHAT_WEBHOOK）
-      - name: Notify WeCom new params
+      # —— 训练后推送 —— 
+      - name: Notify WeCom AFTER training
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          MSG: |
+            Training done - ${{ job.status }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -n "${WECHAT_WEBHOOK}" ]; then
-            python - <<'PY'
-            import json, os, urllib.request
-            hook = os.environ.get('WECHAT_WEBHOOK')
-            try:
-              with open('config/params.json','r',encoding='utf-8') as f:
-                params = json.load(f)
-            except Exception as e:
-              params = {"error": f"load params.json failed: {e}"}
-            msg = "✅ 训练完成，已更新参数\n" + json.dumps(params, ensure_ascii=False)
-            data = json.dumps({"msgtype":"text","text":{"content": msg}}).encode()
-            req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
-            try:
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    print("WeCom:", r.status)
-            except Exception as e:
-                print("WeCom error:", e)
-            PY
-          else
-            echo "WECHAT_WEBHOOK is empty; skip training notification."
-          fi
+          python .github/scripts/wecom_notify.py

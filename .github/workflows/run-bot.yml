@@ -2,7 +2,7 @@ name: run-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"        # 每 5 分钟一次（按需改）
+    - cron: "*/5 * * * *"   # 每5分钟一次
   workflow_dispatch:
 
 jobs:
@@ -21,70 +21,48 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          pip install requests
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # 运行前把当前参数发一条（仅当设置了 WECHAT_WEBHOOK）
-      - name: Notify WeCom BEFORE run (params snapshot)
+      # —— 运行前推送（参数快照） ——
+      - name: Notify WeCom BEFORE run
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          MSG: |
+            Ping BEFORE run #${{ github.run_number }}
+            Repo: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Actor: ${{ github.actor }}
+            Time: ${{ github.run_id }}
         run: |
-          if [ -n "${WECHAT_WEBHOOK}" ]; then
-            python - <<'PY'
-            import json, os, urllib.request
-            hook = os.environ.get('WECHAT_WEBHOOK')
-            try:
-              with open('config/params.json','r',encoding='utf-8') as f:
-                params = json.load(f)
-            except Exception as e:
-              params = {"error": f"load params.json failed: {e}"}
-            msg = "🧩 当前策略参数\n" + json.dumps(params, ensure_ascii=False)
-            data = json.dumps({"msgtype":"text","text":{"content": msg}}).encode()
-            req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
-            try:
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    print("WeCom:", r.status)
-            except Exception as e:
-                print("WeCom error:", e)
-            PY
-          else
-            echo "WECHAT_WEBHOOK is empty; skip BEFORE notification."
-          fi
+          python .github/scripts/wecom_notify.py
 
+      # —— 运行你的主程序 ——（保持你现有 main.py 路径）
       - name: Run trading bot
         env:
           BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
           BINANCE_TESTNET: ${{ secrets.BINANCE_TESTNET }}
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          ENABLE_TRADING: ${{ secrets.ENABLE_TRADING }}
+          ORDER_USDT: ${{ secrets.ORDER_USDT }}
+          PAPER: ${{ secrets.PAPER }}
         run: |
           mkdir -p logs
-          python bot/main.py | tee -a "logs/$(date -u +'%Y-%m-%d').log"
+          python bot/main.py 2>&1 | tee -a "logs/$(date -u +'%Y-%m-%d').log"
 
-      # 运行后发一条简要状态（仅当设置了 WECHAT_WEBHOOK）
+      # —— 运行后推送结果 ——
       - name: Notify WeCom AFTER run
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          MSG: |
+            Run #${{ github.run_number }} - ${{ job.status }}
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -n "${WECHAT_WEBHOOK}" ]; then
-            python - <<'PY'
-            import json, os, urllib.request
-            hook = os.environ.get('WECHAT_WEBHOOK')
-            msg  = f"Run #{os.environ.get('GITHUB_RUN_NUMBER')} finished: {os.environ.get('GITHUB_JOB','run')}"
-            data = json.dumps({"msgtype":"text","text":{"content": msg}}).encode()
-            req  = urllib.request.Request(hook, data=data, headers={"Content-Type":"application/json"})
-            try:
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    print("WeCom:", r.status)
-            except Exception as e:
-                print("WeCom error:", e)
-            PY
-          else
-            echo "WECHAT_WEBHOOK is empty; skip AFTER notification."
-          fi
+          python .github/scripts/wecom_notify.py
 
+      # —— 上传日志（可选） ——
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
