@@ -49,8 +49,10 @@ jobs:
 
       # —— 执行训练/回测 ——（按你实际训练脚本路径改）
       - name: Run training
-        run: |
-          python trainer/train.py
+  env:
+    PYTHONPATH: ${{ github.workspace }}
+  run: |
+    python -m trainer.train
 
       # —— 提交参数或模型（按你需要替换路径）——
       - name: Commit updated params.json
