@@ -2,19 +2,15 @@ name: train-and-update
 
 on:
   schedule:
-    - cron: "0 */6 * * *"        # 每 6 小时运行一次
+    - cron: "0 */6 * * *"  # 每 6 小时触发一次（按需改）
   workflow_dispatch:
 
 permissions:
-  contents: write                # 允许提交参数更新
+  contents: write
 
 jobs:
   train:
     runs-on: ubuntu-latest
-
-    # <<< 关键：把 secrets 提升到 job 级环境变量 >>>
-    env:
-      WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
 
     steps:
       - name: Checkout repo
@@ -32,18 +28,15 @@ jobs:
 
       - name: Validate params.json
         run: |
-          python - <<'PY'
-          import json
-          with open('config/params.json','rb') as f:
-              json.load(f)
-          print('params.json OK')
-          PY
+          python -c "import json,sys;json.load(open('config/params.json','rb'));print('params.json OK')"
 
       - name: Notify WeCom BEFORE training
-        if: ${{ env.WECHAT_WEBHOOK != '' }}
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training start #${{ github.run_number }}
+            Repo:   ${{ github.repository }}
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
         run: |
@@ -52,6 +45,8 @@ jobs:
       - name: Run training
         env:
           PYTHONPATH: ${{ github.workspace }}
+          SYMBOLS: ${{ secrets.SYMBOLS }}   # 关键：从 Secrets 读取交易对（逗号分隔）
+          # INTERVAL: "1h"                  # 如需强制覆盖，可打开此行
         run: |
           python -m trainer.train
 
@@ -64,8 +59,9 @@ jobs:
           git push
 
       - name: Notify WeCom AFTER training
-        if: ${{ env.WECHAT_WEBHOOK != '' }}
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training done - ${{ job.status }}
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

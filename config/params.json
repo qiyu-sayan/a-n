@@ -1,12 +1,14 @@
 {
-  "SYMBOLS": ["BTCUSDT", "ETHUSDT"],
-  "ORDER_USDT": 10,
-  "PAPER": true,
-  "ENABLE_TRADING": false,
-  "STRATEGY": {
-    "type": "ma_cross",
+  "symbols": [],
+  "interval": "1h",
+  "risk": {
+    "max_pos": 0.3,
+    "stop": 0.02,
+    "take": 0.04
+  },
+  "logic": {
     "fast": 12,
     "slow": 26,
-    "qty": 0.001
+    "sig": 9
   }
 }
