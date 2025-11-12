@@ -1,8 +1,11 @@
 {
-  "symbols": [],
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT"
+  ],
   "interval": "1h",
   "risk": {
-    "max_pos": 0.3,
+    "max_pos": 0.315,
     "stop": 0.02,
     "take": 0.04
   },
