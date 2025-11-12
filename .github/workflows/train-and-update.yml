@@ -22,16 +22,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Validate params.json
+        shell: bash
         run: |
-          python -c "import json,sys;json.load(open('config/params.json','rb'));print('params.json OK')"
+          python - <<'PY'
+          import json; json.load(open('config/params.json','rb'))
+          print('params.json OK')
+          PY
 
+      # 训练前推送（用 shell 判断，不在 if: 里用 secrets）
       - name: Notify WeCom BEFORE training
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
+        shell: bash
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
@@ -40,17 +46,23 @@ jobs:
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
         run: |
-          python .github/scripts/wecom_notify.py
+          if [ -n "${WECHAT_WEBHOOK}" ]; then
+            python .github/scripts/wecom_notify.py
+          else
+            echo "WECHAT_WEBHOOK empty; skip notify BEFORE."
+          fi
 
       - name: Run training
+        shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
           SYMBOLS: ${{ secrets.SYMBOLS }}   # 关键：从 Secrets 读取交易对（逗号分隔）
-          # INTERVAL: "1h"                  # 如需强制覆盖，可打开此行
+          # INTERVAL: "1h"                  # 如需强制覆盖可打开
         run: |
           python -m trainer.train
 
       - name: Commit updated params.json
+        shell: bash
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -58,12 +70,17 @@ jobs:
           git commit -m "chore: update params via training #${{ github.run_number }}" || echo "nothing to commit"
           git push
 
+      # 训练后推送（同样用 shell 判断）
       - name: Notify WeCom AFTER training
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
+        shell: bash
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training done - ${{ job.status }}
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python .github/scripts/wecom_notify.py
+          if [ -n "${WECHAT_WEBHOOK}" ]; then
+            python .github/scripts/wecom_notify.py
+          else
+            echo "WECHAT_WEBHOOK empty; skip notify AFTER."
+          fi
