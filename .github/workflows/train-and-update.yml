@@ -2,15 +2,20 @@ name: train-and-update
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # 每 6 小时运行一次
+    - cron: "0 */6 * * *"        # 每 6 小时运行一次
   workflow_dispatch:
 
 permissions:
-  contents: write          # 允许提交参数更新
+  contents: write                # 允许提交参数更新
 
 jobs:
   train:
     runs-on: ubuntu-latest
+
+    # <<< 关键：把 secrets 提升到 job 级环境变量 >>>
+    env:
+      WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -25,20 +30,18 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # 训练前校验 JSON，避免 JSONDecodeError
       - name: Validate params.json
         run: |
           python - <<'PY'
-          import json,sys
-          json.load(open('config/params.json','rb'))
+          import json
+          with open('config/params.json','rb') as f:
+              json.load(f)
           print('params.json OK')
           PY
 
-      # 运行前推送（可选）
       - name: Notify WeCom BEFORE training
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
+        if: ${{ env.WECHAT_WEBHOOK != '' }}
         env:
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training start #${{ github.run_number }}
             Branch: ${{ github.ref_name }}
@@ -46,14 +49,12 @@ jobs:
         run: |
           python .github/scripts/wecom_notify.py
 
-      # === 核心：执行训练（注意 env 下的 PYTHONPATH）===
       - name: Run training
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m trainer.train
 
-      # 提交参数或模型等变更
       - name: Commit updated params.json
         run: |
           git config user.name  "github-actions[bot]"
@@ -62,11 +63,9 @@ jobs:
           git commit -m "chore: update params via training #${{ github.run_number }}" || echo "nothing to commit"
           git push
 
-      # 训练结束推送（可选）
       - name: Notify WeCom AFTER training
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
+        if: ${{ env.WECHAT_WEBHOOK != '' }}
         env:
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training done - ${{ job.status }}
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
