@@ -2,20 +2,15 @@ name: train-and-update
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # 每6小时一次，按需改
+    - cron: "0 */6 * * *"   # 每 6 小时运行一次
   workflow_dispatch:
 
 permissions:
-  contents: write   # 训练后自动提交需要写权限
+  contents: write          # 允许提交参数更新
 
 jobs:
   train:
     runs-on: ubuntu-latest
-
-    # 同样把 secrets 映射到 env，便于 if 判断
-    env:
-      WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -30,16 +25,20 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # —— 训练前校验 params.json（避免 JSONDecodeError）——
+      # 训练前校验 JSON，避免 JSONDecodeError
       - name: Validate params.json
         run: |
-          python -c "import json,sys;json.load(open('config/params.json','rb'));print('params.json OK')"
+          python - <<'PY'
+          import json,sys
+          json.load(open('config/params.json','rb'))
+          print('params.json OK')
+          PY
 
-      # —— 训练前推送 —— 
+      # 运行前推送（可选）
       - name: Notify WeCom BEFORE training
-        if: ${{ env.WECHAT_WEBHOOK != '' }}
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
-          WECHAT_WEBHOOK: ${{ env.WECHAT_WEBHOOK }}
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training start #${{ github.run_number }}
             Branch: ${{ github.ref_name }}
@@ -47,14 +46,14 @@ jobs:
         run: |
           python .github/scripts/wecom_notify.py
 
-      # —— 执行训练/回测 ——（按你实际训练脚本路径改）
+      # === 核心：执行训练（注意 env 下的 PYTHONPATH）===
       - name: Run training
-  env:
-    PYTHONPATH: ${{ github.workspace }}
-  run: |
-    python -m trainer.train
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m trainer.train
 
-      # —— 提交参数或模型（按你需要替换路径）——
+      # 提交参数或模型等变更
       - name: Commit updated params.json
         run: |
           git config user.name  "github-actions[bot]"
@@ -63,11 +62,11 @@ jobs:
           git commit -m "chore: update params via training #${{ github.run_number }}" || echo "nothing to commit"
           git push
 
-      # —— 训练后推送 —— 
+      # 训练结束推送（可选）
       - name: Notify WeCom AFTER training
-        if: ${{ env.WECHAT_WEBHOOK != '' }}
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
-          WECHAT_WEBHOOK: ${{ env.WECHAT_WEBHOOK }}
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training done - ${{ job.status }}
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
