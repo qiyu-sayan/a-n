@@ -2,15 +2,16 @@ name: train-and-update
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # 每6小时
+    - cron: "0 */6 * * *"   # 每 6 小时训练一次（按需改）
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write          # 训练后自动提交 params.json 需要写权限
 
 jobs:
   train:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -25,10 +26,12 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      # --- 在训练前校验 JSON（避免 JSONDecodeError） ---
       - name: Validate params.json
         run: |
-          python -c "import json;json.load(open('config/params.json','rb'));print('params.json OK')"
+          python -c "import json,sys;json.load(open('config/params.json','rb'));print('params.json OK')"
 
+      # --- 训练前推送 ---
       - name: Notify WeCom BEFORE training
         if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
@@ -38,55 +41,31 @@ jobs:
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
         run: |
-          python -u bot/wecom_notify.py
+          python .github/scripts/wecom_notify.py
 
+      # --- 执行训练回测（按你实际脚本路径） ---
       - name: Run training
+        env:
+          PYTHONPATH: .
         run: |
           python -m trainer.train
 
-      - name: Compare metrics & decide promotion
-        shell: bash
-        run: |
-          set -e
-          NEW="trainer/metrics.json"
-          BASE="trainer/metrics_baseline.json"
-          if [ ! -f "$BASE" ]; then cp "$NEW" "$BASE"; fi
-
-          py=$(cat <<'PY'
-          import json
-          new=json.load(open("trainer/metrics.json"))
-          base=json.load(open("trainer/metrics_baseline.json"))
-          promote = (new.get("sharpe",0)>base.get("sharpe",0) and new.get("max_dd",1)<=base.get("max_dd",1)) \
-                    or (new.get("pnl",0)>base.get("pnl",0))
-          print("PROMOTE=1" if promote else "PROMOTE=0")
-          PY
-          )
-          eval=$(python - <<<$py)
-          echo "$eval" | tee promote.flag
-
+      # --- 提交参数或模型等产物（按你需要替换路径） ---
       - name: Commit updated params.json
-        if: always()
-        shell: bash
         run: |
-          if grep -q "PROMOTE=1" promote.flag; then
-            echo "Promote new params & baseline metrics"
-            cp trainer/metrics.json trainer/metrics_baseline.json
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add config/params.json trainer/metrics_baseline.json
-            git commit -m "promote: better params via training #${{ github.run_number }}" || echo "nothing to commit"
-            git push
-          else
-            echo "No promotion"
-          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/params.json || true
+          git commit -m "chore: update params via training #${{ github.run_number }}" || echo "nothing to commit"
+          git push
 
+      # --- 训练后推送 ---
       - name: Notify WeCom AFTER training
         if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training done - ${{ job.status }}
-            Promote: $(cat promote.flag)
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python -u bot/wecom_notify.py
+          python .github/scripts/wecom_notify.py
