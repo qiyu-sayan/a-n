@@ -33,7 +33,6 @@ jobs:
 
       # --- 训练前推送 ---
       - name: Notify WeCom BEFORE training
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
@@ -41,7 +40,11 @@ jobs:
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
         run: |
-          python .github/scripts/wecom_notify.py
+          if [ -z "${WECHAT_WEBHOOK}" ]; then
+            echo "WECHAT_WEBHOOK is empty, skip BEFORE training notification"
+          else
+            python .github/scripts/wecom_notify.py
+          fi
 
       # --- 执行训练回测（按你实际脚本路径） ---
       - name: Run training
@@ -61,11 +64,14 @@ jobs:
 
       # --- 训练后推送 ---
       - name: Notify WeCom AFTER training
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Training done - ${{ job.status }}
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python .github/scripts/wecom_notify.py
+          if [ -z "${WECHAT_WEBHOOK}" ]; then
+            echo "WECHAT_WEBHOOK is empty, skip AFTER training notification"
+          else
+            python .github/scripts/wecom_notify.py
+          fi
