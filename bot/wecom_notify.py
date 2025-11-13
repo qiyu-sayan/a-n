@@ -1,51 +1,28 @@
 # bot/wecom_notify.py
-import os, json, time, traceback
+"""
+用法：
+  env 里传入：
+    WECHAT_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+    MSG            = 任意文本（支持多行）
+  然后运行：python -u bot/wecom_notify.py
+"""
+import os, json, sys, urllib.request
 
-try:
-    import requests
-except Exception:
-    requests = None  # 交给 workflow 安装 requests
-
-def wecom_notify(text: str, at_all: bool = False):
-    """
-    企业微信文本消息推送。环境变量 WECHAT_WEBHOOK 必须预先配置。
-    """
-    url = os.getenv("WECHAT_WEBHOOK", "").strip()
-    if not url or not requests:
+def wecom_notify():
+    hook = os.getenv("WECHAT_WEBHOOK", "").strip()
+    msg  = os.getenv("MSG", "").strip()
+    if not hook:
+        print("no WECHAT_WEBHOOK, skip")
         return
-    payload = {
-        "msgtype": "text",
-        "text": {
-            "content": text,
-            "mentioned_list": ["@all"] if at_all else []
-        }
-    }
+    payload = {"msgtype":"text", "text":{"content": msg[:19990]}}
+    data = json.dumps(payload).encode("utf-8")
     try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        pass
-
-
-def wrap_run(run_callable):
-    """
-    统一包装：开跑通知 / 异常通知（简短堆栈）/ 结束通知（耗时）。
-    不改变你的策略逻辑。
-    """
-    run_no = os.getenv("GITHUB_RUN_NUMBER", "local")
-    start = time.time()
-    wecom_notify(f"▶️ Run #{run_no} 开始")
-    try:
-        result = run_callable()
-        dur = int(time.time() - start)
-        wecom_notify(f"✅ Run #{run_no} 结束，用时 {dur}s")
-        return result
+        req = urllib.request.Request(hook, data=data,
+                headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print("wecom:", r.status)
     except Exception as e:
-        tb = traceback.format_exc(limit=6)
-        short_tb = "\n".join(tb.splitlines()[-12:])
-        wecom_notify(f"❌ Run #{run_no} 异常：{e}\n{short_tb}")
-        raise
+        print("wecom error:", e, file=sys.stderr)
 
-
-def warn_451(url: str):
-    """针对 451 地区限制的专用提醒。检测到就发一条，不抛异常。"""
-    wecom_notify(f"⚠️ 收到 HTTP 451（地区限制）：\n{url}\n建议切换出海网络或改用兼容的行情源")
+if __name__ == "__main__":
+    wecom_notify()

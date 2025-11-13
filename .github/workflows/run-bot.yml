@@ -2,23 +2,12 @@ name: run-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 每5分钟一次，按需改
+    - cron: "*/5 * * * *"   # 每5分钟
   workflow_dispatch:
 
 jobs:
   trade:
     runs-on: ubuntu-latest
-
-    # 将 Secrets 映射到 env，供 steps 使用 & if 判断
-    env:
-      WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-      BINANCE_KEY:     ${{ secrets.BINANCE_KEY }}
-      BINANCE_SECRET:  ${{ secrets.BINANCE_SECRET }}
-      BINANCE_TESTNET: ${{ secrets.BINANCE_TESTNET }}
-      ENABLE_TRADING:  ${{ secrets.ENABLE_TRADING }}
-      ORDER_USDT:      ${{ secrets.ORDER_USDT }}
-      PAPER:           ${{ secrets.PAPER }}
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -33,44 +22,45 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # —— 运行前推送（参数快照）——
+      # 运行前快照（如你不想发可删掉这步）
       - name: Notify WeCom BEFORE run
-        if: ${{ env.WECHAT_WEBHOOK != '' }}
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
-          WECHAT_WEBHOOK: ${{ env.WECHAT_WEBHOOK }}
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Ping BEFORE run #${{ github.run_number }}
-            Repo:   ${{ github.repository }}
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
-            Actor:  ${{ github.actor }}
-            Time:   ${{ github.run_id }}
+            Repo:  ${{ github.repository }}
+            Commit:${{ github.sha }}
         run: |
-          python .github/scripts/wecom_notify.py
+          python -u bot/wecom_notify.py
 
-      # —— 运行你的主程序 ——（保持你原有 main.py 路径）
       - name: Run trading bot
         env:
-          BINANCE_KEY:     ${{ env.BINANCE_KEY }}
-          BINANCE_SECRET:  ${{ env.BINANCE_SECRET }}
-          BINANCE_TESTNET: ${{ env.BINANCE_TESTNET }}
-          ENABLE_TRADING:  ${{ env.ENABLE_TRADING }}
-          ORDER_USDT:      ${{ env.ORDER_USDT }}
-          PAPER:           ${{ env.PAPER }}
+          BINANCE_KEY:     ${{ secrets.BINANCE_KEY }}
+          BINANCE_SECRET:  ${{ secrets.BINANCE_SECRET }}
+          BINANCE_TESTNET: ${{ secrets.BINANCE_TESTNET }}
+          ENABLE_TRADING:  ${{ secrets.ENABLE_TRADING }}
+          ORDER_USDT:      ${{ secrets.ORDER_USDT }}
+          PAPER:           ${{ secrets.PAPER }}
+          # 下面是新增的安全阀
+          RISK_LIMIT_USDT: ${{ secrets.RISK_LIMIT_USDT }}
+          MAX_OPEN_TRADES: ${{ secrets.MAX_OPEN_TRADES }}
+          STOP_LOSS_PCT:   ${{ secrets.STOP_LOSS_PCT }}
+          TAKE_PROFIT_PCT: ${{ secrets.TAKE_PROFIT_PCT }}
+          SLIPPAGE_BPS:    ${{ secrets.SLIPPAGE_BPS }}
         run: |
-          mkdir -p logs
-          python bot/main.py 2>&1 | tee -a "logs/$(date -u +'%Y-%m-%d').log"
+          mkdir -p logs data
+          python -u bot/main.py 2>&1 | tee -a "logs/$(date -u +'%Y-%m-%dT%H-%M-%S').log"
 
-      # —— 运行后推送结果 —— 
       - name: Notify WeCom AFTER run
-        if: ${{ env.WECHAT_WEBHOOK != '' }}
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
-          WECHAT_WEBHOOK: ${{ env.WECHAT_WEBHOOK }}
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Run #${{ github.run_number }} - ${{ job.status }}
             Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python .github/scripts/wecom_notify.py
+          python -u bot/wecom_notify.py
 
       - name: Upload logs
         if: always()
@@ -78,3 +68,10 @@ jobs:
         with:
           name: logs_${{ github.run_id }}
           path: logs
+
+      - name: Upload trade log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade_log_${{ github.run_id }}
+          path: data/trade_log.csv
