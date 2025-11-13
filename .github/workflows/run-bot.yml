@@ -30,7 +30,6 @@ jobs:
 
       # --- 运行前推送（参数快照） ---
       - name: Notify WeCom BEFORE run
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
@@ -41,9 +40,13 @@ jobs:
             Actor: ${{ github.actor }}
             Time:  ${{ github.run_id }}
         run: |
-          python .github/scripts/wecom_notify.py
+          if [ -z "${WECHAT_WEBHOOK}" ]; then
+            echo "WECHAT_WEBHOOK is empty, skip BEFORE notification"
+          else
+            python .github/scripts/wecom_notify.py
+          fi
 
-      # --- 运行你的主程序（记得保持路径为 bot/main.py） ---
+      # --- 运行你的主程序（保持路径为 bot/main.py） ---
       - name: Run trading bot
         env:
           BINANCE_KEY:        ${{ secrets.BINANCE_KEY }}
@@ -63,14 +66,17 @@ jobs:
 
       # --- 运行后推送（结果＋链接） ---
       - name: Notify WeCom AFTER run
-        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
             Run #${{ github.run_number }} - ${{ job.status }}
             Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python .github/scripts/wecom_notify.py
+          if [ -z "${WECHAT_WEBHOOK}" ]; then
+            echo "WECHAT_WEBHOOK is empty, skip AFTER notification"
+          else
+            python .github/scripts/wecom_notify.py
+          fi
 
       # --- 上传日志文件，方便排查 ---
       - name: Upload logs
