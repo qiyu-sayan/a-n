@@ -2,11 +2,11 @@ name: train-and-update
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # 每 6 小时训练一次（按需改）
+    - cron: "0 */6 * * *"   # 每 6 小时自动训练
   workflow_dispatch:
 
 permissions:
-  contents: write          # 训练后自动提交 params.json 需要写权限
+  contents: write          # 提交 params.json 必须写权限
 
 jobs:
   train:
@@ -26,12 +26,10 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # --- 在训练前校验 JSON（避免 JSONDecodeError） ---
       - name: Validate params.json
         run: |
           python -c "import json,sys;json.load(open('config/params.json','rb'));print('params.json OK')"
 
-      # --- 训练前推送 ---
       - name: Notify WeCom BEFORE training
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
@@ -41,28 +39,25 @@ jobs:
             Commit: ${{ github.sha }}
         run: |
           if [ -z "${WECHAT_WEBHOOK}" ]; then
-            echo "WECHAT_WEBHOOK is empty, skip BEFORE training notification"
+            echo "Webhook empty -> skip BEFORE notification"
           else
             python .github/scripts/wecom_notify.py
           fi
 
-      # --- 执行训练回测（按你实际脚本路径） ---
       - name: Run training
         env:
           PYTHONPATH: .
         run: |
           python -m trainer.train
 
-      # --- 提交参数或模型等产物（按你需要替换路径） ---
       - name: Commit updated params.json
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add config/params.json || true
-          git commit -m "chore: update params via training #${{ github.run_number }}" || echo "nothing to commit"
+          git commit -m "update params via training #${{ github.run_number }}" || echo "nothing to commit"
           git push
 
-      # --- 训练后推送 ---
       - name: Notify WeCom AFTER training
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
@@ -71,7 +66,7 @@ jobs:
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ -z "${WECHAT_WEBHOOK}" ]; then
-            echo "WECHAT_WEBHOOK is empty, skip AFTER training notification"
+            echo "Webhook empty -> skip AFTER notification"
           else
             python .github/scripts/wecom_notify.py
           fi
