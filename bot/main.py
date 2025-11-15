@@ -1,290 +1,289 @@
 # bot/main.py
 """
-简单版自动交易主程序：
-- 从 config/params.json 读取交易配置（symbols / interval 等）
-- 定时拉取 Binance 永续合约 K 线
-- 用非常简单的均线策略生成信号（之后可以换成你自己的）
-- 下单前用 trade_utils 里的风控做检查
-- 下单后记录 trade_log.csv，方便训练 / 复盘
+MACD + RSI 组合策略自动交易机器人
 
-依赖：
-  pip install python-binance
+环境变量（通过 GitHub Secrets 传入）：
+- BINANCE_KEY        : 币安 API Key
+- BINANCE_SECRET     : 币安 Secret Key
+- BINANCE_TESTNET    : "true"/"false"   是否使用测试网
+- ENABLE_TRADING     : "true"/"false"   是否允许真实下单
+- PAPER              : "true"/"false"   是否仅模拟（不触碰交易所）
+- ORDER_USDT         : 每笔交易使用的 USDT 金额，例如 "10"
+- SYMBOLS            : 要交易的交易对，逗号分隔，例如 "BTCUSDT,ETHUSDT"
 
-环境变量（由 GitHub Actions 注入）：
-  BINANCE_KEY
-  BINANCE_SECRET
-  BINANCE_TESTNET   -> "1"表示用 testnet
-  ENABLE_TRADING    -> "true" 才真的下单
-  ORDER_USDT        -> 每笔名义金额，例如 10
-  PAPER             -> "true" 只纸面交易，不打到交易所
-
-  RISK_LIMIT_USDT
-  MAX_OPEN_TRADES
-  STOP_LOSS_PCT
-  TAKE_PROFIT_PCT
-  SLIPPAGE_BPS
+策略概要：
+- 只做多（现货）
+- MACD 金叉 + RSI 在 [50, 70) 时买入
+- 买入后立刻挂止损卖单（默认 0.5% 止损，可在 STOP_LOSS_PCT 调整）
 """
 
 import os
-import time
-import json
+import sys
+import math
 import logging
-from typing import Dict, Any, List
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
 
 from binance.client import Client
-from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-from bot.trade_utils import (
-    enforce_risk_limits,
-    price_with_slippage,
-    oco_levels,
-    append_trade_log,
-    safe_json,
-)
+# ===== 基本配置 =====
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.005"))  # 0.5% 止损
+INTERVAL = os.getenv("INTERVAL", "15m")  # 默认 15 分钟 K 线
 
-# ----------------- 日志配置 -----------------
+API_KEY = os.getenv("BINANCE_KEY")
+API_SECRET = os.getenv("BINANCE_SECRET")
+TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
+ENABLE_TRADING = os.getenv("ENABLE_TRADING", "false").lower() == "true"
+PAPER = os.getenv("PAPER", "true").lower() == "true"
+ORDER_USDT = float(os.getenv("ORDER_USDT", "10"))
 
+SYMBOLS_ENV = os.getenv("SYMBOLS", "BTCUSDT")
+SYMBOLS = [s.strip().upper() for s in SYMBOLS_ENV.split(",") if s.strip()]
+
+# ===== 日志设置 =====
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-
 logger = logging.getLogger(__name__)
 
-# ----------------- 配置与客户端 -----------------
 
-
-def load_params(path: str = "config/params.json") -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    # 一些默认值兜底
-    cfg.setdefault("symbols", ["BTCUSDT"])
-    cfg.setdefault("interval", "1m")
-    cfg.setdefault("lookback", 200)
-    cfg.setdefault("fast_ma", 7)
-    cfg.setdefault("slow_ma", 25)
-    cfg.setdefault("risk", {})
-    return cfg
-
-
+# ===== 币安客户端封装 =====
 def create_client() -> Client:
-    key = os.getenv("BINANCE_KEY", "")
-    secret = os.getenv("BINANCE_SECRET", "")
-    testnet_flag = os.getenv("BINANCE_TESTNET", "0").lower() in ("1", "true", "yes")
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("BINANCE_KEY / BINANCE_SECRET 未设置")
 
-    client = Client(key, secret)
+    client = Client(API_KEY, API_SECRET)
 
-    if testnet_flag:
-        # Binance 合约 testnet 端点
-        client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-        logger.info("Using Binance FUTURES TESTNET endpoint")
+    if TESTNET:
+        # python-binance 测试网地址
+        client.API_URL = "https://testnet.binance.vision/api"
+        logger.info("使用 Binance TESTNET")
     else:
-        logger.info("Using Binance FUTURES LIVE endpoint")
+        logger.info("使用 Binance MAINNET")
 
     return client
 
 
-def is_trading_enabled() -> bool:
-    return os.getenv("ENABLE_TRADING", "false").lower() == "true"
+def get_symbol_precision(client: Client, symbol: str):
+    """获取交易数量和价格精度，用于正确下单"""
+    info = client.get_symbol_info(symbol)
+    if info is None:
+        raise RuntimeError(f"无法获取交易对信息: {symbol}")
+
+    qty_precision = 8
+    price_precision = 8
+
+    for f in info["filters"]:
+        if f["filterType"] == "LOT_SIZE":
+            step = float(f["stepSize"])
+            qty_precision = max(0, int(round(-math.log10(step))))
+        if f["filterType"] == "PRICE_FILTER":
+            tick = float(f["tickSize"])
+            price_precision = max(0, int(round(-math.log10(tick))))
+
+    return qty_precision, price_precision
 
 
-def is_paper_trading() -> bool:
-    return os.getenv("PAPER", "true").lower() == "true"
+def fetch_klines(client: Client, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    """拉取 K 线数据并转为 DataFrame"""
+    raw = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore",
+    ]
+    df = pd.DataFrame(raw, columns=cols)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
+    return df
 
 
-def get_order_usdt() -> float:
-    try:
-        return float(os.getenv("ORDER_USDT", "10"))
-    except Exception:
-        return 10.0
+# ===== 技术指标计算 =====
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["close"]
+
+    # MACD
+    ema_fast = close.ewm(span=12, adjust=False).mean()
+    ema_slow = close.ewm(span=26, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal = macd.ewm(span=9, adjust=False).mean()
+
+    # RSI
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0.0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+
+    df["macd"] = macd
+    df["signal"] = signal
+    df["rsi"] = rsi
+
+    return df
 
 
-# ----------------- 数据 / 策略 -----------------
+# ===== 策略逻辑：MACD + RSI 组合 =====
+def generate_signal(df: pd.DataFrame):
+    """返回 'BUY' / 'FLAT'"""
+    if len(df) < 35:
+        return "FLAT"
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    macd_now = last["macd"]
+    signal_now = last["signal"]
+    macd_prev = prev["macd"]
+    signal_prev = prev["signal"]
+    rsi_now = last["rsi"]
+
+    if any(pd.isna([macd_now, signal_now, macd_prev, signal_prev, rsi_now])):
+        return "FLAT"
+
+    # MACD 金叉
+    bull_cross = macd_prev <= signal_prev and macd_now > signal_now
+    # RSI 过滤：50~70 之间，偏多但不过热
+    rsi_ok = 50 <= rsi_now < 70
+
+    if bull_cross and rsi_ok:
+        return "BUY"
+
+    return "FLAT"
 
 
-def fetch_klines(
-    client: Client, symbol: str, interval: str, limit: int = 200
-) -> List[Dict[str, Any]]:
-    """拉取 K 线，返回 list[dict]，只保留 open_time, open, high, low, close, volume"""
-    raw = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-    bars = []
-    for k in raw:
-        bars.append(
-            {
-                "open_time": k[0],
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            }
-        )
-    return bars
+# ===== 交易执行相关 =====
+def has_open_orders(client: Client, symbol: str) -> bool:
+    orders = client.get_open_orders(symbol=symbol)
+    return len(orders) > 0
 
 
-def ma(values: List[float], window: int) -> float:
-    if len(values) < window:
-        return sum(values) / max(len(values), 1)
-    return sum(values[-window:]) / window
+def get_last_price(client: Client, symbol: str) -> float:
+    ticker = client.get_symbol_ticker(symbol=symbol)
+    return float(ticker["price"])
 
 
-def generate_signal(
-    closes: List[float], fast: int, slow: int
-) -> str:
-    """非常简单的均线交叉：fast>slow 买入；fast<slow 卖出；其余不动"""
-    if len(closes) < slow:
-        return "hold"
-    fast_ma = ma(closes, fast)
-    slow_ma = ma(closes, slow)
-    logger.info("fast_ma=%.4f slow_ma=%.4f", fast_ma, slow_ma)
-    if fast_ma > slow_ma * 1.001:
-        return "long"
-    elif fast_ma < slow_ma * 0.999:
-        return "short"
-    else:
-        return "hold"
+def calc_quantity(usdt_amount: float, price: float, qty_precision: int) -> float:
+    raw_qty = usdt_amount / price
+    fmt = "{:0." + str(qty_precision) + "f}"
+    return float(fmt.format(raw_qty))
 
 
-# ----------------- 持仓与下单 -----------------
-
-
-def get_open_positions_count(client: Client, symbol: str) -> int:
-    """简化版：看该 symbol 是否有正/负仓位"""
-    positions = client.futures_position_information(symbol=symbol)
-    cnt = 0
-    for p in positions:
-        pos_amt = float(p.get("positionAmt", "0"))
-        if abs(pos_amt) > 1e-6:
-            cnt += 1
-    return cnt
-
-
-def calc_order_qty(usdt: float, price: float, step_size: float = 0.001) -> float:
-    """按名义金额计算数量，并粗略对齐到 step_size"""
-    if price <= 0:
-        return 0.0
-    qty = usdt / price
-    # 向下取整到交易所步长（这里先简单用 3 位小数）
-    qty = int(qty / step_size) * step_size
-    return round(qty, 6)
-
-
-def place_futures_market_order(
+def place_order_with_sl(
     client: Client,
     symbol: str,
     side: str,
-    qty: float,
-) -> Dict[str, Any]:
-    """真正打到 Binance 的订单。只处理市价单。"""
-    resp = client.futures_create_order(
-        symbol=symbol,
-        side=side,
-        type=ORDER_TYPE_MARKET,
-        quantity=qty,
-    )
-    return resp
+    usdt_amount: float,
+    stop_loss_pct: float,
+    qty_precision: int,
+    price_precision: int,
+):
+    """市价开仓 + 挂止损卖单"""
+    price = get_last_price(client, symbol)
+    qty = calc_quantity(usdt_amount, price, qty_precision)
 
-
-# ----------------- 主流程 -----------------
-
-
-def trade_symbol(client: Client, cfg: Dict[str, Any], symbol: str):
-    interval = cfg["interval"]
-    lookback = int(cfg.get("lookback", 200))
-    fast = int(cfg.get("fast_ma", 7))
-    slow = int(cfg.get("slow_ma", 25))
-
-    logger.info("=== Trading %s (interval=%s) ===", symbol, interval)
-
-    bars = fetch_klines(client, symbol, interval, limit=lookback)
-    closes = [b["close"] for b in bars]
-    last_price = closes[-1]
-
-    signal = generate_signal(closes, fast, slow)
-    logger.info("Signal for %s: %s (last_price=%.4f)", symbol, signal, last_price)
-
-    if signal == "hold":
-        return
-
-    order_usdt = get_order_usdt()
-    qty = calc_order_qty(order_usdt, last_price)
     if qty <= 0:
-        logger.warning("qty <= 0, skip")
+        logger.warning(f"{symbol}: 计算得到的下单数量 <= 0，跳过。")
         return
 
-    side = SIDE_BUY if signal == "long" else SIDE_SELL
+    logger.info(f"{symbol}: 计划 {side}，价格≈{price}, 数量={qty}")
 
-    # ---- 下单前：风控检查 ----
-    open_cnt = get_open_positions_count(client, symbol)
-    enforce_risk_limits(symbol, last_price, qty, open_cnt)
+    if PAPER or not ENABLE_TRADING:
+        logger.info(f"{symbol}: PAPER 模式 / 关闭真实交易，仅打印模拟下单。")
+        return
 
-    # 轻微滑点：虽然是 MARKET 单，但我们把“理论成交价”调一下，用于日志 / 风控
-    adj_price = price_with_slippage(last_price, "buy" if side == SIDE_BUY else "sell")
+    try:
+        if side.upper() == "BUY":
+            order = client.order_market_buy(symbol=symbol, quantity=qty)
+        else:
+            order = client.order_market_sell(symbol=symbol, quantity=qty)
 
-    live = is_trading_enabled()
-    paper = is_paper_trading()
+        logger.info(f"{symbol}: 市价单已提交: {order['orderId']}")
+    except (BinanceAPIException, BinanceRequestException) as e:
+        logger.error(f"{symbol}: 市价单下单失败: {e}")
+        return
 
-    logger.info(
-        "Ready to place order: symbol=%s side=%s qty=%s notional=%.2f live=%s paper=%s",
-        symbol,
-        side,
-        qty,
-        adj_price * qty,
-        live,
-        paper,
-    )
+    # 止损价
+    stop_price = price * (1 - stop_loss_pct)
+    fmt = "{:0." + str(price_precision) + "f}"
+    stop_price_str = fmt.format(stop_price)
 
-    ts = int(time.time())
-    resp: Dict[str, Any] = {}
+    try:
+        sl_order = client.create_order(
+            symbol=symbol,
+            side=Client.SIDE_SELL,
+            type=Client.ORDER_TYPE_STOP_LOSS_LIMIT,
+            timeInForce=Client.TIME_IN_FORCE_GTC,
+            quantity=qty,
+            price=stop_price_str,
+            stopPrice=stop_price_str,
+        )
+        logger.info(f"{symbol}: 止损单已挂单: {sl_order['orderId']} @ {stop_price_str}")
+    except (BinanceAPIException, BinanceRequestException) as e:
+        logger.error(f"{symbol}: 止损单下单失败: {e}")
 
-    if live and not paper:
-        # 真正下单
-        resp = place_futures_market_order(client, symbol, side, qty)
-        logger.info("Order response: %s", safe_json(resp))
-    else:
-        # 纸面交易 / 关闭实盘模式
-        logger.info("Dry-run / paper trade, no real order sent")
-        resp = {
-            "symbol": symbol,
-            "side": side,
-            "qty": qty,
-            "price": adj_price,
-            "paper": True,
-        }
 
-    # 这里我们只记录开仓，exit_price / pnl 先用 0，等平仓逻辑完善后再补充
-    append_trade_log(
-        ts=ts,
-        symbol=symbol,
-        side="LONG" if signal == "long" else "SHORT",
-        qty=qty,
-        entry=adj_price,
-        exit_px=0.0,
-        pnl=0.0,
-        reason="entry",
-    )
+# ===== 主流程 =====
+def run_for_symbol(client: Client, symbol: str):
+    logger.info(f"===== 处理交易对 {symbol} =====")
 
-    # 计算并打印止盈/止损价（现在只是打印，没有真正挂单）
-    tp, sl = oco_levels(adj_price)
-    logger.info("TP=%.4f SL=%.4f (未真正挂单，需要再接 Binance OCO / 止损接口)", tp, sl)
+    try:
+        qty_precision, price_precision = get_symbol_precision(client, symbol)
+        df = fetch_klines(client, symbol, INTERVAL)
+        df = add_indicators(df)
+        signal = generate_signal(df)
+        last = df.iloc[-1]
+        logger.info(
+            f"{symbol}: 收盘价={last['close']:.4f}, MACD={last['macd']:.5f}, "
+            f"Signal={last['signal']:.5f}, RSI={last['rsi']:.2f}, 信号={signal}"
+        )
+
+        if has_open_orders(client, symbol):
+            logger.info(f"{symbol}: 有未成交/挂单订单，跳过本次信号。")
+            return
+
+        if signal == "BUY":
+            place_order_with_sl(
+                client,
+                symbol,
+                "BUY",
+                ORDER_USDT,
+                STOP_LOSS_PCT,
+                qty_precision,
+                price_precision,
+            )
+        else:
+            logger.info(f"{symbol}: 当前信号为 {signal}，不交易。")
+
+    except (BinanceAPIException, BinanceRequestException) as e:
+        logger.error(f"{symbol}: Binance API 错误: {e}")
+    except Exception as e:
+        logger.exception(f"{symbol}: 未预期错误: {e}")
 
 
 def main():
-    cfg = load_params()
+    logger.info("=== 自动交易机器人启动（MACD + RSI）===")
+    logger.info(
+        f"TESTNET={TESTNET}, ENABLE_TRADING={ENABLE_TRADING}, "
+        f"PAPER={PAPER}, ORDER_USDT={ORDER_USDT}, SYMBOLS={SYMBOLS}"
+    )
+
     client = create_client()
 
-    logger.info("Config: %s", safe_json(cfg))
+    for symbol in SYMBOLS:
+        run_for_symbol(client, symbol)
 
-    symbols = cfg.get("symbols", [])
-    if not symbols:
-        logger.warning("No symbols configured, exit")
-        return
-
-    for sym in symbols:
-        try:
-            trade_symbol(client, cfg, sym)
-        except Exception as e:
-            logger.exception("Error trading %s: %s", sym, e)
+    logger.info("=== 本次运行结束 ===")
 
 
 if __name__ == "__main__":
