@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import ccxt
 
-from bot.wecom_notify import wecom_notify, warn_451
+from wecom_notify import wecom_notify, warn_451
 
 
 # ========== 一些全局设置 ==========
