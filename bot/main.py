@@ -5,7 +5,7 @@ import json
 import time
 from datetime import datetime, timezone
 
-import ccxt  # 你 repo 里已经装过，如果不是 ccxt 而是 python-binance，再跟我说一声我们换一版
+import ccxt
 
 from bot.wecom_notify import wecom_notify, warn_451
 
