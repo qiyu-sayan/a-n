@@ -1,194 +1,177 @@
-# bot/main.py
-
 import os
 import json
-import time
+import traceback
 from datetime import datetime, timezone
 
 import ccxt
+from wecom_notify import wecom_notify  # 只用这个，不再导入 warn_451
 
-from wecom_notify import wecom_notify, warn_451
-
-
-# ========== 一些全局设置 ==========
-# DEBUG: 是否强制测试下单（先开着验证一下，之后建议关掉）
-FORCE_TEST_ORDER = True      # ✅ 现在先设成 True，确认能在测试网看到订单
-FORCE_TEST_SYMBOL = "BTC/USDT"
-FORCE_TEST_USDT = 10         # 每次测试单 10 USDT
-
-PARAMS_PATH = os.path.join("config", "params.json")
+CONFIG_PATH = "config/params.json"
 
 
-# ========== 工具函数 ==========
-
-def load_config(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg
-
-
-def get_ccxt_client():
-    """根据环境变量构建 ccxt binance 客户端（支持测试网 / 实盘切换）"""
-
-    api_key = os.getenv("BINANCE_KEY")
-    api_secret = os.getenv("BINANCE_SECRET")
-    if not api_key or not api_secret:
-        raise RuntimeError("缺少 BINANCE_KEY / BINANCE_SECRET 环境变量")
-
-    use_testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
-
-    options = {
-        "apiKey": api_key,
-        "secret": api_secret,
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "spot",
-        },
-    }
-
-    if use_testnet:
-        # Spot Testnet 的专用 API 域名
-        options["urls"] = {
-            "api": {
-                "public": "https://testnet.binance.vision/api",
-                "private": "https://testnet.binance.vision/api",
-            }
-        }
-
-    exchange = ccxt.binance(options)
-    return exchange, use_testnet
-
-
-def get_account_info(exchange: ccxt.binance):
-    """获取账号资产（调试用）"""
-    balance = exchange.fetch_balance()
-    return balance
-
-
-def calc_trade_amount_usdt(balance, max_usdt: float):
-    """根据账户 USDT 余额和风控上限，算出这次最多能动用多少 USDT"""
-    free_usdt = balance.get("free", {}).get("USDT", 0)
-    return min(free_usdt, max_usdt)
-
-
-def place_market_buy_usdt(exchange, symbol: str, usdt_amount: float):
-    """用指定 USDT 金额市价买入 symbol（如 BTC/USDT）"""
-    market = exchange.market(symbol)
-    ticker = exchange.fetch_ticker(symbol)
-    last_price = ticker["last"]
-
-    # 按市价换算出数量，再根据交易所精度做裁剪
-    amount = usdt_amount / last_price
-    amount = float(exchange.amount_to_precision(symbol, amount))
-
-    if amount <= 0:
-        raise RuntimeError(f"计算出来的下单数量 <= 0，usdt={usdt_amount}, price={last_price}")
-
-    order = exchange.create_market_buy_order(symbol, amount)
-    return order
-
-
-# ========== 你的策略逻辑占位 ==========
-def run_strategy_and_get_signal(cfg, exchange):
-    """
-    这里本来应该是你真正的策略逻辑：
-    - 拉历史 K 线
-    - 计算因子 / 指标
-    - 决定这次是 BUY / SELL / HOLD
-    为了简单起见，先返回一个“永远不交易”的占位，下面我们用 FORCE_TEST_ORDER 去测试通路。
-    """
-
-    # 例子：正常情况下返回类似这样的结构：
-    # return {
-    #     "action": "buy",   # "buy" / "sell" / "hold"
-    #     "symbol": "BTC/USDT",
-    #     "usdt": 50,
-    # }
-    return {
-        "action": "hold",
-        "symbol": None,
-        "usdt": 0,
-    }
-
-
-# ========== 主流程 ==========
-
-def main():
-    # 1. 加载配置
-    cfg = load_config(PARAMS_PATH)
-
-    enable_trading = os.getenv("ENABLE_TRADING", "false").lower() == "true"
-
-    # 2. 初始化交易所
-    exchange, use_testnet = get_ccxt_client()
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
-    print(f"[{now}] Bot started. testnet={use_testnet}, enable_trading={enable_trading}, FORCE_TEST_ORDER={FORCE_TEST_ORDER}")
-
-    # 3. 打印一下账户资产，方便你在日志里确认真的连上了测试网
+def load_config() -> dict:
+    """从 config/params.json 里读一些默认配置，没有就用空字典。"""
     try:
-        balance = get_account_info(exchange)
-        free_usdt = balance.get("free", {}).get("USDT", 0)
-        print(f"[INFO] Free USDT: {free_usdt}")
-    except Exception as e:
-        warn_451(f"获取账户余额失败: {e}")
-        raise
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print("[main] params.json not found, using defaults")
+        return {}
+    except json.JSONDecodeError as e:
+        print(f"[main] params.json JSON 解析错误: {e}")
+        return {}
 
-    # 4. 如果强制测试下单开关打开，直接在测试网市价买一点 BTC/USDT
-    if FORCE_TEST_ORDER:
-        if not enable_trading:
-            print("[WARN] ENABLE_TRADING=false，虽然 FORCE_TEST_ORDER=True，但出于安全考虑不下单。")
-        else:
+
+def str2bool(s: str, default: bool = False) -> bool:
+    if s is None:
+        return default
+    return str(s).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def normalize_symbol(sym: str) -> str:
+    """
+    尽量兼容两种写法：
+    - 'BTCUSDT'  -> 'BTC/USDT'
+    - 'BTC/USDT' -> 'BTC/USDT'
+    """
+    sym = sym.strip().upper()
+    if "/" in sym:
+        return sym
+    if sym.endswith("USDT"):
+        return sym[:-4] + "/USDT"
+    return sym
+
+
+def parse_symbols(cfg: dict) -> list[str]:
+    """
+    优先用环境变量 SYMBOLS，其次用 params.json 里的 symbols，最后默认 BTC/USDT。
+    - SYMBOLS 可以是：'BTCUSDT,ETHUSDT' 或 '["BTCUSDT","ETHUSDT"]'
+    """
+    env_symbols = os.getenv("SYMBOLS", "").strip()
+    symbols: list[str] | None = None
+
+    if env_symbols:
+        if env_symbols.startswith("["):
+            # JSON 格式
             try:
-                usdt_to_use = min(FOURCE_TEST_USDT := FORCE_TEST_USDT, float(free_usdt))
-                if usdt_to_use <= 0:
-                    print("[WARN] 账户 USDT 余额为 0，无法下测试单。")
-                else:
-                    print(f"[TEST] 在 {FORCE_TEST_SYMBOL} 上下测试买单，金额 {usdt_to_use} USDT ...")
-                    order = place_market_buy_usdt(exchange, FORCE_TEST_SYMBOL, usdt_to_use)
-                    msg = f"[TEST] Testnet 下单成功：{order}"
-                    print(msg)
-                    wecom_notify(msg)
-            except Exception as e:
-                msg = f"[TEST-ERROR] Testnet 下单失败：{e}"
-                print(msg)
-                warn_451(msg)
+                arr = json.loads(env_symbols)
+                if isinstance(arr, list):
+                    symbols = [str(x) for x in arr]
+            except json.JSONDecodeError:
+                pass
+        if symbols is None:
+            # 逗号分隔格式
+            symbols = [s for s in env_symbols.split(",") if s.strip()]
 
-        # 测试模式下面的真实策略逻辑就先不跑了，直接 return。
-        return
+    if not symbols:
+        cfg_symbols = cfg.get("symbols") or cfg.get("SYMBOLS")
+        if isinstance(cfg_symbols, list) and cfg_symbols:
+            symbols = [str(x) for x in cfg_symbols]
 
-    # 5. 正常策略逻辑（FORCE_TEST_ORDER=False 时才会走到这里）
-    signal = run_strategy_and_get_signal(cfg, exchange)
-    print(f"[INFO] Strategy signal: {signal}")
+    if not symbols:
+        symbols = ["BTCUSDT"]
 
-    if signal["action"] == "hold":
-        print("[INFO] 策略这次选择观望，不交易。")
-        return
+    return [normalize_symbol(s) for s in symbols]
+
+
+def make_exchange():
+    api_key = os.getenv("BINANCE_KEY")
+    secret = os.getenv("BINANCE_SECRET")
+    is_testnet = str2bool(os.getenv("BINANCE_TESTNET", "true"), True)
+
+    if not api_key or not secret:
+        raise RuntimeError("BINANCE_KEY / BINANCE_SECRET 没有设置，无法下单")
+
+    exchange = ccxt.binance(
+        {
+            "apiKey": api_key,
+            "secret": secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+        }
+    )
+
+    # ccxt 的测试网开关
+    if is_testnet:
+        exchange.set_sandbox_mode(True)
+
+    return exchange, is_testnet
+
+
+def run_bot():
+    cfg = load_config()
+
+    enable_trading = str2bool(os.getenv("ENABLE_TRADING", "false"), False)
+    paper = str2bool(os.getenv("PAPER", "true"), True)
+    order_usdt_str = os.getenv("ORDER_USDT", "10")
+
+    try:
+        order_usdt = float(order_usdt_str)
+    except ValueError:
+        order_usdt = 10.0
+
+    symbols = parse_symbols(cfg)
+
+    exchange, is_testnet = make_exchange()
+
+    head = [
+        "🚀 Bot 开始运行",
+        f"时间: {datetime.now(timezone.utc).astimezone().isoformat()}",
+        f"环境: {'TESTNET(模拟盘)' if is_testnet else 'LIVE(实盘)'}",
+        f"ENABLE_TRADING: {enable_trading}",
+        f"PAPER(纸上仿真): {paper}",
+        f"每笔下单 USDT: {order_usdt}",
+        f"交易标的: {', '.join(symbols)}",
+    ]
+    head_msg = "\n".join(head)
+    print(head_msg)
+    wecom_notify(head_msg)
 
     if not enable_trading:
-        print(f"[DRY-RUN] ENABLE_TRADING=false，只打印信号不下单：{signal}")
-        return
-
-    # 6. 按策略信号真正下单（这里以市价单为例）
-    try:
-        if signal["action"] == "buy":
-            order = place_market_buy_usdt(exchange, signal["symbol"], signal["usdt"])
-            msg = f"[TRADE] BUY {signal['symbol']} with {signal['usdt']} USDT, order={order}"
-        elif signal["action"] == "sell":
-            # 这里你可以再写个 place_market_sell_xxx，根据持仓数量来卖
-            msg = "[TODO] 卖出逻辑还没写。"
-            order = None
-        else:
-            msg = f"[WARN] 未知动作: {signal['action']}"
-            order = None
-
+        msg = "ENABLE_TRADING = false，本次只做连通性测试，不下单。"
         print(msg)
         wecom_notify(msg)
+        return
 
-    except Exception as e:
-        msg = f"[ERROR] 实际下单失败: {e}"
-        print(msg)
-        warn_451(msg)
+    results: list[str] = []
+
+    for sym in symbols:
+        try:
+            ticker = exchange.fetch_ticker(sym)
+            last = ticker.get("last") or ticker.get("close")
+            if not last:
+                results.append(f"{sym}: 获取价格失败，跳过。")
+                continue
+
+            amount = order_usdt / float(last)
+
+            if paper:
+                line = f"[PAPER] {sym}: 价格约 {last:.4f}，理论买入数量 {amount:.6f}"
+                print(line)
+                results.append(line)
+            else:
+                order = exchange.create_market_buy_order(sym, amount)
+                line = f"[REAL] {sym}: 市价买入 {amount:.6f}，订单ID: {order.get('id')}"
+                print(line)
+                results.append(line)
+
+        except Exception as e:  # noqa: BLE001
+            err = f"{sym}: 下单失败 - {e}"
+            print(err)
+            results.append(err)
+
+    summary = "本次运行结果：\n" + "\n".join(results)
+    wecom_notify(summary)
+
+
+def main():
+    try:
+        run_bot()
+        wecom_notify("✅ 本次 run-bot 任务执行完毕")
+    except Exception as e:  # noqa: BLE001
+        tb = traceback.format_exc()
+        print(tb)
+        wecom_notify(f"❌ run-bot 发生异常: {e}\n\n{tb[:1500]}")
 
 
 if __name__ == "__main__":
