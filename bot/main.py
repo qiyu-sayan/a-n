@@ -4,11 +4,48 @@ import traceback
 from datetime import datetime, timezone
 
 import ccxt
-from wecom_notify import wecom_notify  # 只用这个，不再导入 warn_451
+import urllib.request
+
 
 CONFIG_PATH = "config/params.json"
 
 
+# ========= 企业微信发送 =========
+def send_wecom(text: str) -> None:
+    """
+    直接用 webhook 给企业微信发文本消息。
+    使用仓库 Secrets 里的 WECHAT_WEBHOOK（你现在就在用的那个）。
+    """
+    webhook = os.getenv("WECHAT_WEBHOOK", "").strip()
+    if not webhook:
+        print("[wecom] WECHAT_WEBHOOK 未配置，跳过发送：")
+        print(text)
+        return
+
+    payload = {
+        "msgtype": "text",
+        "text": {
+            "content": text,
+        },
+    }
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            resp_body = resp.read().decode("utf-8")
+        print("[wecom] 已发送：", resp_body)
+    except Exception as e:  # noqa: BLE001
+        print("[wecom] 发送失败：", e)
+        print("内容：", text)
+
+
+# ========= 配置 & 工具 =========
 def load_config() -> dict:
     """从 config/params.json 里读一些默认配置，没有就用空字典。"""
     try:
@@ -98,6 +135,7 @@ def make_exchange():
     return exchange, is_testnet
 
 
+# ========= 主交易逻辑 =========
 def run_bot():
     cfg = load_config()
 
@@ -125,12 +163,12 @@ def run_bot():
     ]
     head_msg = "\n".join(head)
     print(head_msg)
-    wecom_notify(head_msg)
+    send_wecom(head_msg)
 
     if not enable_trading:
         msg = "ENABLE_TRADING = false，本次只做连通性测试，不下单。"
         print(msg)
-        wecom_notify(msg)
+        send_wecom(msg)
         return
 
     results: list[str] = []
@@ -161,17 +199,17 @@ def run_bot():
             results.append(err)
 
     summary = "本次运行结果：\n" + "\n".join(results)
-    wecom_notify(summary)
+    send_wecom(summary)
 
 
 def main():
     try:
         run_bot()
-        wecom_notify("✅ 本次 run-bot 任务执行完毕")
+        send_wecom("✅ 本次 run-bot 任务执行完毕")
     except Exception as e:  # noqa: BLE001
         tb = traceback.format_exc()
         print(tb)
-        wecom_notify(f"❌ run-bot 发生异常: {e}\n\n{tb[:1500]}")
+        send_wecom(f"❌ run-bot 发生异常: {e}\n\n{tb[:1500]}")
 
 
 if __name__ == "__main__":
