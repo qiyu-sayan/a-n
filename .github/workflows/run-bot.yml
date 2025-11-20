@@ -1,53 +1,49 @@
 name: run-bot
 
 on:
-  # 只支持手动点按钮运行，先别自动定时
   workflow_dispatch:
 
 jobs:
   trade:
-    runs-on:
-      - self-hosted
-      - Linux
-      - X64
+    runs-on: self-hosted
+
+    env:
+      # Binance Demo API 的密钥，从仓库 Secrets 里读取
+      BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
+      BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+
+      # 当前环境：我们只用 DEMO（demo.binance.com）
+      BINANCE_MODE: DEMO
+
+      # 先只跑策略，不真实下单
+      ENABLE_TRADING: "false"
+      PAPER_TRADING: "false"
+
+      # 交易相关参数
+      TRADE_SYMBOLS: "BTCUSDT"
+      TRADE_USDT: "10"
 
     steps:
-      # 1. 拉代码
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 2. Python 环境
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3. 安装依赖
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
-      # 4. 跑交易脚本（现在只看行情，不强制下单）
       - name: Run trading bot
-        env:
-          BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
-          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-          BINANCE_API_URL: ${{ secrets.BINANCE_API_URL }}
-
-          ENABLE_TRADING: ${{ secrets.ENABLE_TRADING }}
-          PAPER: ${{ secrets.PAPER }}
-          ORDER_USDT: ${{ secrets.ORDER_USDT }}
-
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         run: |
           mkdir -p logs
-          python bot/main.py 2>&1 | tee "logs/run-bot-$(date -u +'%Y-%m-%dT%H-%M-%SZ').log"
+          python bot/main.py | tee logs/run-bot.log
 
-      # 5. 上传日志，方便你查看
       - name: Upload logs
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: run-bot-logs-${{ github.run_number }}
+          name: run-bot-logs
           path: logs/
