@@ -7,7 +7,7 @@ on:
 
 jobs:
   trade:
-    runs-on: [self-hosted, vultr]
+    runs-on: [self-hosted, An]
 
     steps:
       - name: Checkout repo
