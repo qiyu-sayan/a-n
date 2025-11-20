@@ -5,7 +5,7 @@
   ],
   "interval": "1h",
   "risk": {
-    "max_pos": 0.156,
+    "max_pos": 0.14,
     "stop": 0.02,
     "take": 0.04
   },
