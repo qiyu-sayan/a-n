@@ -1,38 +1,84 @@
 name: run-bot
 
 on:
+  # 仅手动触发（防止还在调试阶段就一直自动下单）
   workflow_dispatch:
 
 jobs:
   trade:
-    runs-on: self-hosted
+    # 用你的 self-hosted runner（Vultr 那台）
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
 
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v3
+      # 1. 拉取代码
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
+      # 2. 设置 Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install deps
-      run: |
-        pip install --upgrade pip
-        pip install python-binance requests
+      # 3. 安装依赖
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    - name: Run trading bot
-      env:
-        BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
-        BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-        WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
-      run: |
-        mkdir -p logs
-        echo "=== 启动交易脚本 ==="
-        python bot/main.py | tee logs/run.log
+      # 4. 运行前通知（没配 WECHAT_WEBHOOK 会自动跳过）
+      - name: Notify WeCom BEFORE run
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          MSG: |
+            🚀 run-bot 开始运行
+            Repo:   ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Actor:  ${{ github.actor }}
+            Run:    #${{ github.run_number }}
+        run: |
+          python .github/scripts/wecom_notify.py
 
-    - name: Upload logs
-      uses: actions/upload-artifact@v4
-      with:
-        name: run-logs
-        path: logs/run.log
+      # 5. 运行交易脚本（现在只“看行情不强制下单”）
+      - name: Run trading bot
+        env:
+          BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
+          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+          BINANCE_API_URL: ${{ secrets.BINANCE_API_URL }}
+
+          ENABLE_TRADING: ${{ secrets.ENABLE_TRADING }}
+          PAPER: ${{ secrets.PAPER }}
+          ORDER_USDT: ${{ secrets.ORDER_USDT }}
+
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          mkdir -p logs
+          python bot/main.py 2>&1 | tee "logs/run-bot-$(date -u +'%Y-%m-%dT%H-%M-%SZ').log"
+
+      # 6. 上传日志
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-bot-logs-${{ github.run_number }}
+          path: logs/
+
+      # 7. 运行结束通知
+      - name: Notify WeCom AFTER run
+        if: ${{ always() && secrets.WECHAT_WEBHOOK != '' }}
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          MSG: |
+            ✅ run-bot 运行结束
+            Repo:   ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Run:    #${{ github.run_number }}
+            Status: ${{ job.status }}
+        run: |
+          python .github/scripts/wecom_notify.py
