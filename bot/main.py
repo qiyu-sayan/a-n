@@ -10,7 +10,7 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 ENABLE_TRADING = True                # 启用真实下单（demo盘是真下单）
 PAPER_TRADING = False                # 纸面模式（只打印，不下单）
 
-TRADE_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+TRADE_SYMBOLS = ["BTCUSDT"]
 TRADE_AMOUNT_USDT = 10               # 每笔下单金额
 
 # WeCom 通知 (没填就跳过)
