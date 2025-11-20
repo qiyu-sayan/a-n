@@ -2,8 +2,12 @@ name: run-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"    # 每 5 分钟一次（按需改）
+    # 每 5 分钟跑一次（你可以自己调节）
+    - cron: "*/5 * * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   trade:
@@ -21,63 +25,58 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # 先装 requests，避免 requirements.txt 里没写
+          pip install requests
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-      # --- 校验 params.json 是否是合法 JSON（避免 JSONDecodeError） ---
-      - name: Validate params.json
-        run: |
-          python -c "import json,sys;json.load(open('config/params.json','rb'));print('params.json OK')"
-
-      # --- 运行前推送（参数快照） ---
+      # ------ 运行前推送到企业微信（可选） ------
       - name: Notify WeCom BEFORE run
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
-            Ping BEFORE run #${{ github.run_number }}
-            Repo:  ${{ github.repository }}
+            🤖 run-bot 即将运行
+            Repo: ${{ github.repository }}
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
-            Actor: ${{ github.actor }}
-            Time:  ${{ github.run_id }}
+            Run: #${{ github.run_number }}
         run: |
-          if [ -z "${WECHAT_WEBHOOK}" ]; then
-            echo "WECHAT_WEBHOOK is empty, skip BEFORE notification"
-          else
-            python .github/scripts/wecom_notify.py
-          fi
+          python .github/scripts/wecom_notify.py || echo "wecom notify before failed"
 
-      # --- 运行你的主程序（保持路径为 bot/main.py） ---
-- name: Run trading bot
-      env:
-        BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
-        BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-        IS_TESTNET: "false"
-        API_URL: "https://api.binance.com"
-        # 下面这些如果你原来有，就保留；没有就不用加
-        ENABLE_TRADING: "True"
-        PAPER: "False"
-      run: |
-        mkdir -p logs
-        python bot/main.py 2>&1 | tee -a "logs/$(date -u +'%Y-%m-%d').log"
+      # ------ 运行交易 Bot ------
+      - name: Run trading bot
+        env:
+          # 这里用的是你 GitHub 里配置的 Secrets
+          BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
+          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
 
-      # --- 运行后推送（结果＋链接） ---
+          # 用 TESTNET（模拟盘）还是实盘：
+          # 你现在是用 demo.binance.com 创建的测试网密钥，所以保持 true
+          TESTNET: "true"
+
+          # 是否真正下单；如果你想只看日志先不下单，可以改成 "false"
+          ENABLE_TRADING: "true"
+
+          # 可选：这些不设就用 main.py 里的默认/params.json
+          # SYMBOLS: "BTCUSDT,ETHUSDT"
+          # ORDER_USDT: "10"
+          # PAPER: "false"
+        run: |
+          mkdir -p logs
+          python bot/main.py 2>&1 | tee "logs/run-$(date -u '+%Y-%m-%dT%H-%M-%SZ').log"
+
+      # ------ 运行后推送到企业微信（可选） ------
       - name: Notify WeCom AFTER run
+        if: ${{ secrets.WECHAT_WEBHOOK != '' }}
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
           MSG: |
-            Run #${{ github.run_number }} - ${{ job.status }}
-            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            ✅ run-bot 运行结束
+            Repo: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Run: #${{ github.run_number }}
         run: |
-          if [ -z "${WECHAT_WEBHOOK}" ]; then
-            echo "WECHAT_WEBHOOK is empty, skip AFTER notification"
-          else
-            python .github/scripts/wecom_notify.py
-          fi
-
-      # --- 上传日志文件，方便排查 ---
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs_${{ github.run_id }}
-          path: logs
+          python .github/scripts/wecom_notify.py || echo "wecom notify after failed"
