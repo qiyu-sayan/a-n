@@ -47,22 +47,18 @@ jobs:
           fi
 
       # --- 运行你的主程序（保持路径为 bot/main.py） ---
-      - name: Run trading bot
-        env:
-          BINANCE_KEY:        ${{ secrets.BINANCE_KEY }}
-          BINANCE_SECRET:     ${{ secrets.BINANCE_SECRET }}
-          BINANCE_TESTNET:    ${{ secrets.BINANCE_TESTNET }}
-          ENABLE_TRADING:     ${{ secrets.ENABLE_TRADING }}
-          ORDER_USDT:         ${{ secrets.ORDER_USDT }}
-          PAPER:              ${{ secrets.PAPER }}
-          RISK_LIMIT_USDT:    ${{ secrets.RISK_LIMIT_USDT }}
-          MAX_OPEN_TRADES:    ${{ secrets.MAX_OPEN_TRADES }}
-          STOP_LOSS_PCT:      ${{ secrets.STOP_LOSS_PCT }}
-          TAKE_PROFIT_PCT:    ${{ secrets.TAKE_PROFIT_PCT }}
-          SLIPPAGE_BPS:       ${{ secrets.SLIPPAGE_BPS }}
-        run: |
-          mkdir -p logs
-          python bot/main.py 2>&1 | tee -a "logs/$(date -u +'%Y-%m-%dT%H-%M-%SZ')_run.log"
+- name: Run trading bot
+      env:
+        BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
+        BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+        IS_TESTNET: "false"
+        API_URL: "https://api.binance.com"
+        # 下面这些如果你原来有，就保留；没有就不用加
+        ENABLE_TRADING: "True"
+        PAPER: "False"
+      run: |
+        mkdir -p logs
+        python bot/main.py 2>&1 | tee -a "logs/$(date -u +'%Y-%m-%d').log"
 
       # --- 运行后推送（结果＋链接） ---
       - name: Notify WeCom AFTER run
