@@ -1,12 +1,16 @@
 name: run-bot
 
 on:
+  # 手动触发
   workflow_dispatch:
+
+  # 定时触发（UTC 时间，每 5 分钟一次）
+  schedule:
+    - cron: "*/5 * * * *"
 
 jobs:
   trade:
-    # 用自托管的 VPS runner（你已经配好 self-hosted 了）
-    runs-on: self-hosted
+    runs-on: [self-hosted, vultr]
 
     steps:
       - name: Checkout repo
@@ -15,7 +19,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -23,24 +27,26 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run trading bot
-        # 就算脚本返回非 0，也不要让整个 Job 变红
-        continue-on-error: true
         env:
-          BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
-          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-          API_URL: ${{ secrets.API_URL }}
-          ENABLE_TRADING: ${{ secrets.ENABLE_TRADING }}
-          PAPER: ${{ secrets.PAPER }}
-          ORDER_USDT: ${{ secrets.ORDER_USDT }}
-          SYMBOLS: ${{ secrets.SYMBOLS }}
-          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          BINANCE_KEY:      ${{ secrets.BINANCE_KEY }}
+          BINANCE_SECRET:   ${{ secrets.BINANCE_SECRET }}
+          ENABLE_TRADING:   ${{ secrets.ENABLE_TRADING }}
+          PAPER:            ${{ secrets.PAPER }}
+          ORDER_USDT:       ${{ secrets.ORDER_USDT }}
+          SYMBOLS:          ${{ secrets.SYMBOLS }}
+          TAKE_PROFIT_PCT:  ${{ secrets.TAKE_PROFIT_PCT }}
+          STOP_LOSS_PCT:    ${{ secrets.STOP_LOSS_PCT }}
+          RISK_LIMIT_USDT:  ${{ secrets.RISK_LIMIT_USDT }}
+          SLIPPAGE_BPS:     ${{ secrets.SLIPPAGE_BPS }}
+          MAX_OPEN_TRADES:  ${{ secrets.MAX_OPEN_TRADES }}
+          WECHAT_WEBHOOK:   ${{ secrets.WECHAT_WEBHOOK }}
         run: |
           mkdir -p logs
-          python -u bot/main.py 2>&1 | tee logs/run-bot.log
+          python bot/main.py 2>&1 | tee logs/run-bot.log
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-bot-logs
-          path: logs/
+          path: logs
