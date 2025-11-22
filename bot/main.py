@@ -60,39 +60,28 @@ def safe_wecom_notify(text: str) -> None:
 
 def make_client():
     """
-    创建 Binance Client，并返回 (client, raw_api_url, base_api_url)
+    创建 Binance Client（固定走 https://api.binance.com）
 
-    - 优先使用 GitHub Secrets 里的 API_URL
-    - 如果 API_URL 没填，就默认用 https://api.binance.com
-    - 通过 client.API_URL 来设置接口地址（兼容旧版 python-binance）
+    说明：
+    - 适用于 demo.binance.com 生成的现货模拟盘 API Key
+    - 不再使用/依赖 GitHub Secrets 里的 API_URL（即使有也忽略）
     """
+
     api_key = os.getenv("BINANCE_KEY", "").strip()
     api_secret = os.getenv("BINANCE_SECRET", "").strip()
 
     if not api_key or not api_secret:
         raise RuntimeError("BINANCE_KEY / BINANCE_SECRET 没配置好，无法创建客户端")
 
-    raw_api_url = os.getenv("API_URL", "").strip()
-
-    if not raw_api_url:
-        # 没配就用官方 REST 地址（demo 的 API 也是走这个）
-        base_api_url = "https://api.binance.com"
-        raw_api_url = base_api_url
-    else:
-        # 用户自己配了，就规范一下：
-        # 1. 已经带 http:// 或 https:// 的，直接用
-        # 2. 没带协议的，只加一个 https:// 前缀，不再乱加 api 等字符串
-        if "://" in raw_api_url:
-            base_api_url = raw_api_url
-        else:
-            base_api_url = "https://" + raw_api_url
-
-    # 兼容旧版 python-binance：不能传 base_url，只能事后改 API_URL
+    # 用默认配置创建客户端（默认 BASE URL 就是 https://api.binance.com/api）
     client = Client(api_key, api_secret)
-    client.API_URL = base_api_url
 
-    # 先 ping 一下，确认能连上
+    # 测下网，确认连得上（如果这里异常，后面会统一处理）
     client.ping()
+
+    # 仅用于日志展示
+    raw_api_url = "https://api.binance.com"
+    base_api_url = raw_api_url
 
     return client, raw_api_url, base_api_url
 
