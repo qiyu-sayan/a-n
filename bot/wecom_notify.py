@@ -1,28 +1,29 @@
 # bot/wecom_notify.py
-"""
-用法：
-  env 里传入：
-    WECHAT_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
-    MSG            = 任意文本（支持多行）
-  然后运行：python -u bot/wecom_notify.py
-"""
-import os, json, sys, urllib.request
+import os
+import requests
 
-def wecom_notify():
-    hook = os.getenv("WECHAT_WEBHOOK", "").strip()
-    msg  = os.getenv("MSG", "").strip()
-    if not hook:
-        print("no WECHAT_WEBHOOK, skip")
+# 从环境变量里拿企业微信机器人 Webhook（GitHub Actions 那边已经通过 env 传进来了）
+WEBHOOK = os.environ.get("WECHAT_WEBHOOK", "")
+
+
+def wecom_notify(text: str) -> None:
+    """
+    发送一条企业微信 Markdown 消息。
+    text: 要发送的文本内容（支持换行）
+    """
+    if not WEBHOOK:
+        print("[wecom] WECHAT_WEBHOOK 未配置，跳过发送")
         return
-    payload = {"msgtype":"text", "text":{"content": msg[:19990]}}
-    data = json.dumps(payload).encode("utf-8")
-    try:
-        req = urllib.request.Request(hook, data=data,
-                headers={"Content-Type":"application/json"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            print("wecom:", r.status)
-    except Exception as e:
-        print("wecom error:", e, file=sys.stderr)
 
-if __name__ == "__main__":
-    wecom_notify()
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {
+            "content": text
+        },
+    }
+
+    try:
+        resp = requests.post(WEBHOOK, json=payload, timeout=5)
+        print(f"[wecom] status={resp.status_code}, resp={resp.text[:200]}")
+    except Exception as e:
+        print(f"[wecom] 发送失败: {e}")
