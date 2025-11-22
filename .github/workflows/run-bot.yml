@@ -7,43 +7,53 @@ jobs:
   trade:
     runs-on: self-hosted
 
-    env:
-      # Binance Demo API 的密钥，从仓库 Secrets 里读取
-      BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
-      BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-
-      # 当前环境：我们只用 DEMO（demo.binance.com）
-      BINANCE_MODE: DEMO
-
-      # 先只跑策略，不真实下单
-      ENABLE_TRADING: "false"
-      PAPER_TRADING: "false"
-
-      # 交易相关参数
-      TRADE_SYMBOLS: "BTCUSDT"
-      TRADE_USDT: "10"
-
     steps:
+      - name: Set up job
+        run: echo "Start trading bot job"
+
       - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # 保险起见，如果没有 requirements.txt 至少装上 python-binance
+            pip install python-binance
+          fi
 
       - name: Run trading bot
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
+          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+          BINANCE_TESTNET: ${{ secrets.BINANCE_TESTNET }}
+          ENABLE_TRADING: ${{ secrets.ENABLE_TRADING }}
+          PAPER: ${{ secrets.PAPER }}
+          ORDER_USDT: ${{ secrets.ORDER_USDT }}
+          RISK_LIMIT_USDT: ${{ secrets.RISK_LIMIT_USDT }}
+          MAX_OPEN_TRADES: ${{ secrets.MAX_OPEN_TRADES }}
+          STOP_LOSS_PCT: ${{ secrets.STOP_LOSS_PCT }}
+          TAKE_PROFIT_PCT: ${{ secrets.TAKE_PROFIT_PCT }}
+          SLIPPAGE_BPS: ${{ secrets.SLIPPAGE_BPS }}
+          SYMBOLS: ${{ secrets.SYMBOLS }}
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         run: |
           mkdir -p logs
-          python bot/main.py | tee logs/run-bot.log
+          python bot/main.py > logs/run-bot.log 2>&1 || {
+            echo "Bot 执行出错，查看 logs/run-bot.log 获取详情"
+            exit 1
+          }
 
       - name: Upload logs
         uses: actions/upload-artifact@v4
         with:
-          name: run-bot-logs
+          name: run-bot-logs-${{ github.run_id }}
           path: logs/
