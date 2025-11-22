@@ -56,24 +56,27 @@ def safe_wecom_notify(text: str) -> None:
 
 # ========= Binance 客户端 =========
 
-def make_client():
+def make_client() -> Tuple[Client, str, str]:
     api_key = os.getenv("BINANCE_KEY")
     api_secret = os.getenv("BINANCE_SECRET")
     raw_api_url = os.getenv("API_URL", "").strip()
+    is_testnet = os.getenv("IS_TESTNET", "false").lower() == "true"
 
     if not api_key or not api_secret:
-        raise RuntimeError("缺少 BINANCE_KEY / BINANCE_SECRET，请到 GitHub Secrets 中检查")
+        raise RuntimeError("BINANCE_KEY / BINANCE_SECRET 不能为空")
 
-    if not raw_api_url:
-        # 默认正式 API 域名（demo 也是走这个域名）
-        raw_api_url = "https://api.binance.com"
-
-    # python-binance 要求 base_url 以 /api 结尾，否则容易 404
-    base_api_url = raw_api_url.rstrip("/") + "/api"
-
-    client = Client(api_key, api_secret, base_url=base_api_url)
-    # 兼容老版本 python-binance
-    client.API_URL = base_api_url
+    # 默认用正式环境；如果你想强制走 testnet/demo，可以在这里加逻辑
+    if raw_api_url:
+        base_api_url = raw_api_url
+        client = Client(
+            api_key,
+            api_secret,
+            base_endpoint=base_api_url,  # ✅ 用 base_endpoint 替代 base_url
+            testnet=is_testnet,
+        )
+    else:
+        client = Client(api_key, api_secret, testnet=is_testnet)
+        base_api_url = client._base_endpoint  # 仅做打印用
 
     return client, raw_api_url, base_api_url
 
