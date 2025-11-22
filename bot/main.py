@@ -56,7 +56,7 @@ def safe_wecom_notify(text: str) -> None:
 
 # ========= Binance 客户端 =========
 
-def make_client() -> Client:
+def make_client():
     api_key = os.getenv("BINANCE_KEY")
     api_secret = os.getenv("BINANCE_SECRET")
     raw_api_url = os.getenv("API_URL", "").strip()
@@ -65,10 +65,10 @@ def make_client() -> Client:
         raise RuntimeError("缺少 BINANCE_KEY / BINANCE_SECRET，请到 GitHub Secrets 中检查")
 
     if not raw_api_url:
-        # 默认用正式 API 域名（你如果只用 demo，可以把 Secrets 里 API_URL 设成 https://api.binance.com）
+        # 默认正式 API 域名（demo 也是走这个域名）
         raw_api_url = "https://api.binance.com"
 
-    # python-binance 要求 base_url 以 /api 结尾，否则会出现 404 Not Found
+    # python-binance 要求 base_url 以 /api 结尾，否则容易 404
     base_api_url = raw_api_url.rstrip("/") + "/api"
 
     client = Client(api_key, api_secret, base_url=base_api_url)
@@ -83,7 +83,6 @@ def make_client() -> Client:
 def load_symbols() -> List[str]:
     raw = os.getenv("SYMBOLS", "BTCUSDT")
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    # 去重
     uniq = []
     for s in symbols:
         if s not in uniq:
@@ -91,7 +90,7 @@ def load_symbols() -> List[str]:
     return uniq or ["BTCUSDT"]
 
 
-def run_bot() -> None:
+def run_bot() -> bool:
     client, raw_api_url, base_api_url = make_client()
 
     enable_trading = str2bool(os.getenv("ENABLE_TRADING", "false"))
@@ -163,13 +162,24 @@ def run_bot() -> None:
     try:
         safe_wecom_notify(summary)
     except Exception:
-        # 为了安全，再加一层兜底
         pass
 
-    if not overall_ok:
-        # 让 GitHub Actions 也能一眼看出来“有问题但程序没崩”
-        sys.exit(1)
+    # 这里不再 sys.exit(1)，而是把结果返回给上层
+    return overall_ok
 
 
 if __name__ == "__main__":
-    run_bot()
+    try:
+        ok = run_bot()
+        # 即使 ok 为 False，我们也不退出 1，只是在控制台里能看到哪些币种失败。
+        # 如果你以后想让 “有失败就标红”，可以在这里再加一行:
+        # if not ok: sys.exit(1)
+    except Exception as e:
+        # 真正脚本级别的致命错误，才退出 1
+        err_text = f"run-bot 发生致命异常: {e}\n{traceback.format_exc()}"
+        print(err_text)
+        try:
+            safe_wecom_notify(err_text[:1500])
+        except Exception:
+            pass
+        sys.exit(1)
