@@ -56,7 +56,7 @@ def safe_wecom_notify(text: str) -> None:
 
 # ========= Binance 客户端 =========
 
-def make_client() -> Tuple[Client, str, str]:
+def make_client():
     api_key = os.getenv("BINANCE_KEY")
     api_secret = os.getenv("BINANCE_SECRET")
     raw_api_url = os.getenv("API_URL", "").strip()
