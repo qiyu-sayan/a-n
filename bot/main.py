@@ -375,7 +375,7 @@ if __name__ == "__main__":
 
     # warn_451 是你原来用来提醒 451 错误的，这里保留调用
     try:
-        warn_451()
+        wecom_notify()
     except Exception:
         pass
 
