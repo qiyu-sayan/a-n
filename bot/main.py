@@ -54,19 +54,20 @@ def load_config():
     return cfg
 
 
-def make_client(cfg):
-    """
-    创建 Binance 客户端，只用 demo.binance.com 的 API Key，
-    但 REST 地址统一走 https://api.binance.com
-    """
-    if not cfg["api_key"] or not cfg["api_secret"]:
-        raise RuntimeError("BINANCE_KEY / BINANCE_SECRET 没有配置，无法连接 Binance。")
+def make_client():
+    api_key = os.getenv("BINANCE_KEY")
+    api_secret = os.getenv("BINANCE_SECRET")
 
-    client = Client(cfg["api_key"], cfg["api_secret"])
+    # GitHub secrets 中 API_URL 例如: https://testnet.binance.vision
+    raw_api_url = os.getenv("API_URL", "https://testnet.binance.vision")
 
-    # 关键：强制使用 api.binance.com（demo key 在这里也是可用的）
-    client.API_URL = cfg["api_url"]
+    # python-binance 需要 base_url 以 /api 结尾
+    base_api_url = raw_api_url.rstrip("/") + "/api"
 
+    client = Client(api_key, api_secret)
+    client.API_URL = base_api_url
+
+    print(f"REST API 地址: {client.API_URL}")
     return client
 
 
