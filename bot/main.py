@@ -56,27 +56,42 @@ def safe_wecom_notify(text: str) -> None:
 
 # ========= Binance 客户端 =========
 
+# 在 main.py 里，把原来的 make_client 整个删掉，换成下面这个
+
 def make_client():
-    api_key = os.getenv("BINANCE_KEY")
-    api_secret = os.getenv("BINANCE_SECRET")
-    raw_api_url = os.getenv("API_URL", "").strip()
-    is_testnet = os.getenv("IS_TESTNET", "false").lower() == "true"
+    """
+    创建 Binance Client，并返回 (client, raw_api_url, base_api_url)
+
+    - 优先使用 GitHub Secrets 里的 API_URL
+    - 如果 API_URL 没填，就默认用 https://api.binance.com
+    - 不再自动拼什么 apihttps 之类，避免 URL 弄乱
+    """
+    api_key = os.getenv("BINANCE_KEY", "").strip()
+    api_secret = os.getenv("BINANCE_SECRET", "").strip()
 
     if not api_key or not api_secret:
-        raise RuntimeError("BINANCE_KEY / BINANCE_SECRET 不能为空")
+        raise RuntimeError("BINANCE_KEY / BINANCE_SECRET 没配置好，无法创建客户端")
 
-    # 默认用正式环境；如果你想强制走 testnet/demo，可以在这里加逻辑
-    if raw_api_url:
-        base_api_url = raw_api_url
-        client = Client(
-            api_key,
-            api_secret,
-            base_endpoint=base_api_url,  # ✅ 用 base_endpoint 替代 base_url
-            testnet=is_testnet,
-        )
+    raw_api_url = os.getenv("API_URL", "").strip()
+
+    if not raw_api_url:
+        # 没配就用官方 REST 地址（demo key 也走这个域名）
+        base_api_url = "https://api.binance.com"
+        raw_api_url = base_api_url
     else:
-        client = Client(api_key, api_secret, testnet=is_testnet)
-        base_api_url = client._base_endpoint  # 仅做打印用
+        # 用户配了，就做一个很保守的规范化：
+        # 1. 如果里面已经有 '://'，说明是完整 URL，直接用
+        # 2. 否则只加一个 https:// 前缀，绝对不再乱加 'api'
+        if "://" in raw_api_url:
+            base_api_url = raw_api_url
+        else:
+            base_api_url = "https://" + raw_api_url
+
+    # 用 python-binance 的 Client，直接传 base_url
+    client = Client(api_key, api_secret, base_url=base_api_url)
+
+    # 先 ping 一下，看能不能连通
+    client.ping()
 
     return client, raw_api_url, base_api_url
 
