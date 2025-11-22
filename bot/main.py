@@ -1,146 +1,174 @@
-# bot/main.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import os
 import sys
-from datetime import datetime, timezone
+import traceback
+from datetime import datetime
+from typing import List
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
 
-def str2bool(v: str, default: bool = False) -> bool:
-    if v is None:
+# ========= 辅助函数 =========
+
+def str2bool(val: str, default: bool = False) -> bool:
+    if val is None:
         return default
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def load_config():
-    """
-    从环境变量（GitHub Secrets）加载配置。
-    """
-    cfg = {}
-
-    # 核心：你在 demo.binance.com 创建的 API Key
-    cfg["api_key"] = os.getenv("BINANCE_KEY", "").strip()
-    cfg["api_secret"] = os.getenv("BINANCE_SECRET", "").strip()
-
-    # REST 接口地址：这里一定要用 api.binance.com，而不是 demo / testnet
-    api_url = os.getenv("API_URL", "").strip()
-    if not api_url:
-        api_url = "https://api.binance.com"
-    cfg["api_url"] = api_url
-
-    # 交易开关
-    cfg["enable_trading"] = str2bool(os.getenv("ENABLE_TRADING", "false"))
-    cfg["paper_trading"] = str2bool(os.getenv("PAPER", "false"))
-
-    # 每笔下单 USDT 金额（目前代码里不会自动下单，只是展示用）
-    cfg["order_usdt"] = float(os.getenv("ORDER_USDT", "10"))
-
-    # 风险相关参数（现在先不用，只是保留）
-    cfg["risk_limit_usdt"] = float(os.getenv("RISK_LIMIT_USDT", "0") or 0)
-    cfg["max_open_trades"] = int(os.getenv("MAX_OPEN_TRADES", "1") or 1)
-    cfg["stop_loss_pct"] = float(os.getenv("STOP_LOSS_PCT", "2"))  # 例如 2%
-    cfg["take_profit_pct"] = float(os.getenv("TAKE_PROFIT_PCT", "4"))  # 例如 4%
-    cfg["slippage_bps"] = float(os.getenv("SLIPPAGE_BPS", "5"))  # 例如 5 bps = 0.05%
-
-    # 交易标的，逗号分隔，例如：BTCUSDT,ETHUSDT
-    symbols_raw = os.getenv("SYMBOLS", "BTCUSDT")
-    cfg["symbols"] = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
-
-    # 是否标记为“测试网 / 模拟环境”仅用于打印
-    # 你现在是 demo 盘，所以这里我们直接打印 DEMO。
-    cfg["is_testnet_flag"] = os.getenv("BINANCE_TESTNET", "").strip()
-
-    return cfg
+def safe_float(val: str, default: float = 0.0) -> float:
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except Exception:
+        raise RuntimeError(f"环境变量不是数字: {val!r}")
 
 
-def make_client():
+# 尝试安全地调用 wecom_notify
+def safe_wecom_notify(text: str) -> None:
+    webhook = os.getenv("WECHAT_WEBHOOK", "").strip()
+    if not webhook:
+        # 没配置 webhook 就直接跳过
+        return
+    try:
+        from wecom_notify import wecom_notify
+    except Exception:
+        # 没有这个模块/函数就静默忽略
+        return
+
+    try:
+        # 优先按“有参数”的方式调用
+        wecom_notify(text)
+    except TypeError:
+        # 如果原函数不需要参数，再尝试无参调用
+        try:
+            wecom_notify()
+        except Exception:
+            pass
+    except Exception:
+        # 其他异常直接忽略，避免影响交易逻辑
+        pass
+
+
+# ========= Binance 客户端 =========
+
+def make_client() -> Client:
     api_key = os.getenv("BINANCE_KEY")
     api_secret = os.getenv("BINANCE_SECRET")
+    raw_api_url = os.getenv("API_URL", "").strip()
 
-    # GitHub secrets 中 API_URL 例如: https://testnet.binance.vision
-    raw_api_url = os.getenv("API_URL", "https://testnet.binance.vision")
+    if not api_key or not api_secret:
+        raise RuntimeError("缺少 BINANCE_KEY / BINANCE_SECRET，请到 GitHub Secrets 中检查")
 
-    # python-binance 需要 base_url 以 /api 结尾
+    if not raw_api_url:
+        # 默认用正式 API 域名（你如果只用 demo，可以把 Secrets 里 API_URL 设成 https://api.binance.com）
+        raw_api_url = "https://api.binance.com"
+
+    # python-binance 要求 base_url 以 /api 结尾，否则会出现 404 Not Found
     base_api_url = raw_api_url.rstrip("/") + "/api"
 
-    client = Client(api_key, api_secret)
+    client = Client(api_key, api_secret, base_url=base_api_url)
+    # 兼容老版本 python-binance
     client.API_URL = base_api_url
 
-    print(f"REST API 地址: {client.API_URL}")
-    return client
+    return client, raw_api_url, base_api_url
 
 
-def print_header(cfg):
-    """
-    打印本次运行的配置概要。
-    """
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
-    print("📈 Bot 开始运行")
-    print(f"时间: {now}")
-    print(f"环境: DEMO (币安模拟盘 / demo.binance.com)")
-    print(f"REST API 地址: {cfg['api_url']}")
-    print(f"ENABLE_TRADING: {cfg['enable_trading']}")
-    print(f"PAPER_TRADING: {cfg['paper_trading']}")
-    print(f"每笔下单 USDT: {cfg['order_usdt']} （目前不会自动下单，仅作为预留参数）")
-    print(f"交易标的: {', '.join(cfg['symbols'])}")
-    print("-" * 60)
+# ========= 策略占位（当前只看行情，不下单） =========
+
+def load_symbols() -> List[str]:
+    raw = os.getenv("SYMBOLS", "BTCUSDT")
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    # 去重
+    uniq = []
+    for s in symbols:
+        if s not in uniq:
+            uniq.append(s)
+    return uniq or ["BTCUSDT"]
 
 
-def handle_symbol(client: Client, cfg, symbol: str) -> str:
-    """
-    处理单个交易对：
-    目前只：
-      1. 获取最新价格
-      2. 打印结果
-      3. 不自动下单（后续再加策略）
-    返回一个简短的结果字符串，用于最后汇总打印。
-    """
-    print(f"=== 处理交易对: {symbol} ===")
-    try:
-        ticker = client.get_symbol_ticker(symbol=symbol)
-        price = float(ticker["price"])
-        print(f"{symbol} 最新价格: {price:.4f}")
+def run_bot() -> None:
+    client, raw_api_url, base_api_url = make_client()
 
-        # 这里可以以后加策略逻辑，例如：
-        # signal = check_strategy(...)
-        # if cfg['enable_trading'] and not cfg['paper_trading'] and signal == 'BUY':
-        #     place_order(...)
-        # 暂时仅输出说明，不实际下单。
-        print("暂未启用自动下单逻辑，仅检查行情，跳过下单。")
+    enable_trading = str2bool(os.getenv("ENABLE_TRADING", "false"))
+    paper_trading = str2bool(os.getenv("PAPER", "true"))
+    order_usdt = safe_float(os.getenv("ORDER_USDT", "10.0"), 10.0)
 
-        return f"{symbol}: 成功（本次未自动下单，仅检查行情）"
+    symbols = load_symbols()
 
-    except BinanceAPIException as e:
-        print(f"❌ {symbol} 处理失败 - BinanceAPIException: {e.status_code} {e.message}")
-        return f"{symbol}: 失败（BinanceAPIException {e.status_code}: {e.message})"
-    except BinanceRequestException as e:
-        print(f"❌ {symbol} 处理失败 - BinanceRequestException: {str(e)}")
-        return f"{symbol}: 失败（BinanceRequestException: {str(e)})"
-    except Exception as e:
-        print(f"❌ {symbol} 处理失败 - 未知异常: {repr(e)}")
-        return f"{symbol}: 失败（未知异常: {repr(e)})"
+    # 环境识别（纯展示用）
+    env_label = "REAL"
+    url_lower = raw_api_url.lower()
+    if "testnet" in url_lower:
+        env_label = "TESTNET(旧测试网 / testnet.binance.vision)"
+    elif "api.binance.com" in url_lower:
+        env_label = "DEMO(币安模拟盘 / demo.binance.com，用正式 API 域名)"
 
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S+0000")
 
-def run_bot():
-    cfg = load_config()
-    try:
-        client = make_client(cfg)
-    except Exception as e:
-        print(f"❌ 初始化 Binance Client 失败: {repr(e)}")
-        sys.exit(1)
+    header_lines = [
+        "📈 Bot 开始运行",
+        f"时间: {now}",
+        f"环境: {env_label}",
+        f"REST API 地址: {base_api_url}",
+        "",
+        f"ENABLE_TRADING: {enable_trading}",
+        f"PAPER_TRADING: {paper_trading}",
+        f"每笔下单 USDT: {order_usdt}  (当前阶段不会自动下单，仅作为预留参数)",
+        f"交易标的: {', '.join(symbols)}",
+        "-" * 60,
+    ]
 
-    print_header(cfg)
+    for line in header_lines:
+        print(line)
 
-    results = []
-    for symbol in cfg["symbols"]:
-        res = handle_symbol(client, cfg, symbol)
-        results.append(res)
+    per_symbol_results = []
+    overall_ok = True
+
+    for symbol in symbols:
+        print(f"=== 处理交易对: {symbol} ===")
+        try:
+            ticker = client.get_symbol_ticker(symbol=symbol)
+            price = float(ticker["price"])
+            print(f"{symbol} 最新价格: {price:.6f}")
+
+            # 这里是策略占位：当前只打印价格，不做买卖
+            print(f"{symbol}: 当前阶段仅检查行情，不自动下单。")
+
+            per_symbol_results.append(f"- {symbol}: 成功（仅检查行情，未下单）")
+
+        except (BinanceAPIException, BinanceRequestException) as e:
+            overall_ok = False
+            print(f"❌ {symbol} 处理失败 - {type(e).__name__}: {e}")
+            per_symbol_results.append(f"- {symbol}: 失败（{type(e).__name__}: {e}）")
+        except Exception as e:
+            overall_ok = False
+            print(f"❌ {symbol} 处理失败 - 未知异常: {e}")
+            traceback.print_exc()
+            per_symbol_results.append(f"- {symbol}: 失败（未知异常: {e}）")
+
         print("-" * 60)
 
-    print("📊 本次运行结果:")
-    for line in results:
-        print("  -", line)
+    summary_lines = ["📊 本次运行结果:"]
+    summary_lines.extend(per_symbol_results)
+
+    summary = "\n".join(summary_lines)
+    print(summary)
+
+    # WeCom 推送（如果配置了 WECHAT_WEBHOOK）
+    try:
+        safe_wecom_notify(summary)
+    except Exception:
+        # 为了安全，再加一层兜底
+        pass
+
+    if not overall_ok:
+        # 让 GitHub Actions 也能一眼看出来“有问题但程序没崩”
+        sys.exit(1)
 
 
 if __name__ == "__main__":
