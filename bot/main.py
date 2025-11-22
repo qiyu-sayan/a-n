@@ -12,7 +12,7 @@ from typing import Dict, Any
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-from wecom_notify import wecom_notify, warn_451  # 你原来的推送模块
+from wecom_notify import wecom_notify  # 你原来的推送模块
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "state.json"
