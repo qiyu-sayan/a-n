@@ -23,4 +23,5 @@ jobs:
 
       - name: Import trader
         run: |
-          python tools/test_trader_import.py
+          python -m tools.test_trader_import
+
