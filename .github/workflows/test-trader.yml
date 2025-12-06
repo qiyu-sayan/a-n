@@ -1,0 +1,37 @@
+name: test-trader
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: self-hosted
+
+    env:
+      TRADER_EXCHANGE_ID: binance
+
+      # Spot Test secrets
+      SPOT_TEST_API_KEY: ${{ secrets.SPOT_TEST_API_KEY }}
+      SPOT_TEST_API_SECRET: ${{ secrets.SPOT_TEST_API_SECRET }}
+
+      # Futures Test secrets
+      FUTURES_TEST_API_KEY: ${{ secrets.FUTURES_TEST_API_KEY }}
+      FUTURES_TEST_API_SECRET: ${{ secrets.FUTURES_TEST_API_SECRET }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: |
+          pip install ccxt
+          pip install -r requirements.txt || true
+
+      - name: Run test trader
+        run: |
+          python -m tools.test_trader_import
