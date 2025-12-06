@@ -1,0 +1,26 @@
+# .github/workflows/test-trader.yml
+name: test-trader
+
+on:
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  test:
+    runs-on: self-hosted   # 用你现在这台 VPS 这个 runner
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'   # 或者你现在 bot 用的版本，3.10/3.11 都行
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt || true
+          pip install ccxt
+
+      - name: Import trader
+        run: |
+          python tools/test_trader_import.py
