@@ -101,10 +101,28 @@ def _send_wecom_app_text(text: str) -> bool:
 # ============ webhook 机器人方式（可选） ============
 
 def _get_wecom_webhook_url() -> Optional[str]:
-    key = os.getenv("WECOM_WEBHOOK_KEY")
-    if not key:
+    """
+    兼容多种写法：
+    - WECOM_WEBHOOK_KEY : 只填 key
+    - WECOM_WEBHOOK     : 可以填 key，也可以直接填完整 URL
+    - WECHAT_WEBHOOK    : 同上
+    """
+    raw = (
+        os.getenv("WECOM_WEBHOOK_KEY")
+        or os.getenv("WECOM_WEBHOOK")
+        or os.getenv("WECHAT_WEBHOOK")
+    )
+    if not raw:
         return None
-    return f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={key}"
+
+    raw = raw.strip()
+    # 如果已经是完整 URL，直接用
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+
+    # 否则当作 key 拼接
+    return f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={raw}"
+
 
 
 def _send_wecom_webhook(text: str) -> bool:
