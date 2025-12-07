@@ -6,9 +6,9 @@
 - 根据 BOT_ENV 选择 DEMO / LIVE
 - 初始化 OKX Trader
 - 调用策略生成订单
-- 应用基础风控过滤 / 调整订单
+- 应用基础风控过滤 / 调整订单（包含名义金额控制）
 - 调用 Trader 下单
-- 把执行结果推送到企业微信
+- 把执行结果推送到企业微信（显示金额而不是数量）
 """
 
 import os
@@ -35,11 +35,12 @@ MAX_ORDERS_PER_RUN = 4
 # 同一市场 + 同一 symbol + 同一方向，每轮只保留一单
 DEDUPE_SAME_SYMBOL_SIDE = True
 
-# 现货单笔最大名义金额（约，USDT）
-MAX_SPOT_NOTIONAL_USDT = 20.0
+# 现货 / 合约 单笔最大名义金额（约，USDT）
+MAX_SPOT_NOTIONAL_USDT = 10.0
+MAX_FUTURES_NOTIONAL_USDT = 10.0
 
-# 合约单笔最大张数
-MAX_FUTURES_CONTRACTS_PER_ORDER = 2
+# 合约单笔最大张数（再保险）
+MAX_FUTURES_CONTRACTS_PER_ORDER = 50
 
 
 # =============================
@@ -74,34 +75,48 @@ def _build_trader() -> Trader:
 
 
 # =============================
-# 风控：过滤 / 调整订单
+# OKX 客户端（给风控 & 估算金额用）
 # =============================
 
-def _build_okx_clients_for_risk() -> Tuple[ccxt.Exchange, ccxt.Exchange]:
+def _build_okx_clients() -> Tuple[ccxt.Exchange, ccxt.Exchange]:
     spot = ccxt.okx()
     spot.options["defaultType"] = "spot"
 
     swap = ccxt.okx()
     swap.options["defaultType"] = "swap"
 
+    # 预加载合约市场信息（里面有 contractSize）
+    try:
+        swap.load_markets()
+    except Exception as e:
+        print(f"[main] 加载合约市场信息失败: {e}")
+
     return spot, swap
 
 
-def _apply_risk_controls(env: Env, orders: List[OrderRequest]) -> List[OrderRequest]:
-    """
-    对策略生成的订单做基础风控：
+# =============================
+# 风控：过滤 / 调整订单
+# =============================
 
+def _apply_risk_controls(
+    env: Env,
+    orders: List[OrderRequest],
+    spot_ex: ccxt.Exchange,
+    fut_ex: ccxt.Exchange,
+) -> List[OrderRequest]:
+    """
     - 去重：同一 market+symbol+side 每轮只保留一单
     - 限制总单数：最多 MAX_ORDERS_PER_RUN
-    - 限制单笔规模：现货按 USDT 名义金额限制，合约按张数限制
+    - 限制单笔规模：
+        * 现货：按 USDT 名义金额限制
+        * 合约：按 USDT 名义金额限制（使用 contractSize）
     """
     if not orders:
         return []
 
-    # LIVE 环境以后可以加更严格控制，目前主要针对 TEST
     # 去重
     if DEDUPE_SAME_SYMBOL_SIDE:
-        seen: Dict[Tuple[MarketType, str, str], bool] = {}
+        seen: Dict[tuple, bool] = {}
         deduped: List[OrderRequest] = []
         for o in orders:
             key = (o.market, o.symbol, o.side.value)
@@ -115,9 +130,7 @@ def _apply_risk_controls(env: Env, orders: List[OrderRequest]) -> List[OrderRequ
     if len(orders) > MAX_ORDERS_PER_RUN:
         orders = orders[:MAX_ORDERS_PER_RUN]
 
-    # 现货名义金额 / 合约张数限制
-    spot_ex, fut_ex = _build_okx_clients_for_risk()
-
+    # 名义金额限制
     adjusted: List[OrderRequest] = []
     for o in orders:
         if o.market == MarketType.SPOT:
@@ -135,12 +148,34 @@ def _apply_risk_controls(env: Env, orders: List[OrderRequest]) -> List[OrderRequ
             except Exception as e:
                 print(f"[risk] 获取现货价格失败 {o.symbol}: {e}")
         else:
-            if o.amount > MAX_FUTURES_CONTRACTS_PER_ORDER:
-                print(
-                    f"[risk] 合约 {o.symbol} 张数 {o.amount} 超出限制，"
-                    f"调整为 {MAX_FUTURES_CONTRACTS_PER_ORDER}"
+            try:
+                market = fut_ex.market(o.symbol)
+                contract_size = float(
+                    market.get("contractSize")
+                    or market.get("contractValue")
+                    or 1.0
                 )
-                o.amount = MAX_FUTURES_CONTRACTS_PER_ORDER
+                ticker = fut_ex.fetch_ticker(o.symbol)
+                last_price = float(ticker["last"])
+                notional = o.amount * contract_size * last_price
+
+                if notional > MAX_FUTURES_NOTIONAL_USDT and last_price > 0:
+                    max_amt = MAX_FUTURES_NOTIONAL_USDT / (contract_size * last_price)
+                    # 再加一个张数上限保护
+                    max_amt = min(max_amt, MAX_FUTURES_CONTRACTS_PER_ORDER)
+                    print(
+                        f"[risk] 合约 {o.symbol} 名义金额 {notional:.2f} 超出限制，"
+                        f"调整张数为 {max_amt:.4f}"
+                    )
+                    o.amount = max_amt
+                elif o.amount > MAX_FUTURES_CONTRACTS_PER_ORDER:
+                    print(
+                        f"[risk] 合约 {o.symbol} 张数 {o.amount} 超出限制，"
+                        f"调整为 {MAX_FUTURES_CONTRACTS_PER_ORDER}"
+                    )
+                    o.amount = MAX_FUTURES_CONTRACTS_PER_ORDER
+            except Exception as e:
+                print(f"[risk] 处理合约风险失败 {o.symbol}: {e}")
 
         adjusted.append(o)
 
@@ -148,8 +183,70 @@ def _apply_risk_controls(env: Env, orders: List[OrderRequest]) -> List[OrderRequ
 
 
 # =============================
-# 企业微信推送
+# 金额估算 & WeCom 文本格式
 # =============================
+
+def _estimate_notional(
+    req: OrderRequest,
+    spot_ex: ccxt.Exchange,
+    fut_ex: ccxt.Exchange,
+) -> float:
+    """
+    估算下单金额（USDT）。只是用来展示，不要求和成交成本完全一致。
+    """
+    try:
+        if req.market == MarketType.SPOT:
+            ticker = spot_ex.fetch_ticker(req.symbol)
+            last_price = float(ticker["last"])
+            return req.amount * last_price
+        else:
+            market = fut_ex.market(req.symbol)
+            contract_size = float(
+                market.get("contractSize")
+                or market.get("contractValue")
+                or 1.0
+            )
+            ticker = fut_ex.fetch_ticker(req.symbol)
+            last_price = float(ticker["last"])
+            return req.amount * contract_size * last_price
+    except Exception as e:
+        print(f"[main] 估算金额失败 {req.symbol}: {e}")
+        return 0.0
+
+
+def _format_wecom_message(req: OrderRequest, success: bool, error: str | None, notional: float) -> str:
+    env_tag = "DEMO" if req.env == Env.TEST else "LIVE"
+    market_tag = "现货" if req.market == MarketType.SPOT else "合约"
+
+    if req.market == MarketType.SPOT:
+        pos_desc = "现货"
+    else:
+        pos_desc = "合约"
+
+    status = "✅ 成功" if success else "❌ 失败"
+
+    lines = [
+        f"[{env_tag}] [{market_tag}] {status}",
+        f"品种: {req.symbol}",
+        f"方向: {pos_desc} / {req.side.value}",
+    ]
+
+    if notional > 0:
+        lines.append(f"金额: ~{notional:.2f} USDT")
+    else:
+        lines.append(f"数量: {req.amount}")
+
+    if req.leverage is not None and req.market == MarketType.FUTURES:
+        lines.append(f"杠杆: {req.leverage}x")
+
+    if req.reason:
+        lines.append(f"原因: {req.reason}")
+
+    if not success and error:
+        lines.append(f"错误: {error}")
+
+    return "\n".join(lines)
+
 
 def _send_batch_wecom_message(env: Env, orders: List[OrderRequest], messages: List[str]) -> None:
     if not messages:
@@ -174,6 +271,7 @@ def _send_batch_wecom_message(env: Env, orders: List[OrderRequest], messages: Li
 def run_once() -> None:
     env = _load_env()
     trader = _build_trader()
+    spot_ex, fut_ex = _build_okx_clients()
 
     print(f"[main] 运行环境: {env.value}")
 
@@ -187,7 +285,7 @@ def run_once() -> None:
     print(f"[main] 策略生成 {len(raw_orders)} 个原始订单。")
 
     # 2. 应用基础风控
-    orders = _apply_risk_controls(env, raw_orders)
+    orders = _apply_risk_controls(env, raw_orders, spot_ex, fut_ex)
     print(f"[main] 风控后实际执行 {len(orders)} 个订单。")
 
     if not orders:
@@ -203,8 +301,11 @@ def run_once() -> None:
             f"{req.market.value} {req.symbol} {req.side.value} {req.amount}"
         )
         res = trader.place_order(req)
-        msg = Trader.format_wecom_message(req, res)
+
+        notional = _estimate_notional(req, spot_ex, fut_ex)
+        msg = _format_wecom_message(req, res.success, res.error, notional)
         wecom_messages.append(msg)
+
         print(msg)
 
     # 4. 推送企业微信
