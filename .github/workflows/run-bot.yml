@@ -1,52 +1,50 @@
 name: run-bot
 
 on:
-  # 手动触发
-  workflow_dispatch:
-
-  # 定时触发（UTC 时间，每 5 分钟一次）
+  # 定时任务（示例：每 30 分钟跑一次，你可以按需修改 cron）
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"
+
+  # 手动触发方便调试
+  workflow_dispatch:
 
 jobs:
   trade:
     runs-on: self-hosted
 
+    env:
+      # 运行环境：
+      #   test -> 使用 OKX 模拟盘（DEMO）
+      #   live -> 使用 OKX 实盘
+      BOT_ENV: test
+
+      # OKX 模拟盘（Paper Trading）API（你已经在 Secrets 里配好了）
+      OKX_PAPER_API_KEY: ${{ secrets.OKX_PAPER_API_KEY }}
+      OKX_PAPER_API_SECRET: ${{ secrets.OKX_PAPER_API_SECRET }}
+      OKX_PAPER_API_PASSPHRASE: ${{ secrets.OKX_PAPER_API_PASSPHRASE }}
+
+      # OKX 实盘 API（目前可以为空，将来上实盘再配置）
+      OKX_LIVE_API_KEY: ${{ secrets.OKX_LIVE_API_KEY }}
+      OKX_LIVE_API_SECRET: ${{ secrets.OKX_LIVE_API_SECRET }}
+      OKX_LIVE_API_PASSPHRASE: ${{ secrets.OKX_LIVE_API_PASSPHRASE }}
+
+      # 企业微信机器人 Webhook
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install ccxt requests
+          pip install -r requirements.txt || true
 
       - name: Run trading bot
-        env:
-          BINANCE_KEY:      ${{ secrets.BINANCE_KEY }}
-          BINANCE_SECRET:   ${{ secrets.BINANCE_SECRET }}
-          ENABLE_TRADING:   ${{ secrets.ENABLE_TRADING }}
-          PAPER:            ${{ secrets.PAPER }}
-          ORDER_USDT:       ${{ secrets.ORDER_USDT }}
-          SYMBOLS:          ${{ secrets.SYMBOLS }}
-          TAKE_PROFIT_PCT:  ${{ secrets.TAKE_PROFIT_PCT }}
-          STOP_LOSS_PCT:    ${{ secrets.STOP_LOSS_PCT }}
-          RISK_LIMIT_USDT:  ${{ secrets.RISK_LIMIT_USDT }}
-          SLIPPAGE_BPS:     ${{ secrets.SLIPPAGE_BPS }}
-          MAX_OPEN_TRADES:  ${{ secrets.MAX_OPEN_TRADES }}
-          WECHAT_WEBHOOK:   ${{ secrets.WECHAT_WEBHOOK }}
         run: |
-          mkdir -p logs
-          python bot/main.py 2>&1 | tee logs/run-bot.log
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: run-bot-logs
-          path: logs
+          python -m bot.main
