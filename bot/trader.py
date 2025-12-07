@@ -38,11 +38,11 @@ class OrderRequest:
     symbol: str
     side: Side
     amount: float
-    price: Optional[float]                 # None = 市价单
-    leverage: Optional[int] = None        # 合约用
-    position_side: Optional[PositionSide] = None  # 合约用（多/空）
-    reduce_only: bool = False             # 合约平仓用
-    reason: str = ""                      # 人类可读原因，方便推送
+    price: Optional[float] = None                # None = 市价单
+    leverage: Optional[int] = None               # 合约用
+    position_side: Optional[PositionSide] = None # 合约用（多/空），目前主要用来记录方向
+    reduce_only: bool = False                    # 合约平仓用
+    reason: str = ""                             # 人类可读原因，方便推送 / 日志
 
 
 @dataclass
@@ -66,104 +66,60 @@ class OrderResult:
 
 class Trader:
     """
-    统一的 OKX 交易引擎。
+    统一的 OKX 交易引擎（新版）。
 
-    - Env.TEST 使用 OKX 模拟盘（sandbox），读 OKX_PAPER_* 这一套 key
-    - Env.LIVE 使用 OKX 实盘，读 OKX_LIVE_* 这一套 key
+    当前版本的使用方式（和 main.py 一致）：
 
-    OKX 是统一账户，所以 demo/live 各只需要 1 组 key，
-    现货和合约可以共用同一组 key。
+        spot_ex, fut_ex = _create_exchanges(env)
+        trader = Trader(env, spot_ex, fut_ex)
+
+    - 只针对 OKX，一个 Trader 对应一个环境（TEST / LIVE）
+    - 现货 / 合约共用一套 API key（OKX 统一账户）
     """
 
     def __init__(
         self,
-        exchange_id: str,
-        paper_keys: Dict[str, str],
-        live_keys: Dict[str, str],
+        env: Env,
+        spot_ex: ccxt.Exchange,
+        futures_ex: ccxt.Exchange,
     ) -> None:
-        if exchange_id != "okx":
-            # 目前专门为 OKX 写的，后面若要扩展再说
-            raise ValueError("当前 Trader 仅支持 exchange_id='okx'")
+        self.env = env
+        self.spot = spot_ex
+        self.futures = futures_ex
 
-        self.exchange_id = exchange_id
+        # 容忍不同 ccxt 版本下 OKX 的 id 写法
+        okx_ids = {"okx", "okex", "okex5"}
 
-        self._paper = self._create_client(paper_keys, Env.TEST)
-        self._live = self._create_client(live_keys, Env.LIVE)
+        for ex, name in ((self.spot, "现货"), (self.futures, "合约")):
+            ex_id = getattr(ex, "id", "") or ""
+            if ex_id and ex_id.lower() not in okx_ids:
+                raise ValueError(
+                    f"当前 Trader 仅支持 OKX，{name}实际为: {ex_id!r}"
+                )
 
-    # ---------- 内部：创建 ccxt client ----------
+    # ---------- 下单封装 ----------
 
-    def _create_client(self, keys: Dict[str, str], env: Env):
-        api_key = keys.get("apiKey")
-        secret = keys.get("secret")
-        password = keys.get("password")
-
-        if not api_key or not secret or not password:
-            # 没配完整就返回 None，上层会优雅失败
-            return None
-
-        exchange_class = getattr(ccxt, self.exchange_id)
-        exchange = exchange_class(
-            {
-                "apiKey": api_key,
-                "secret": secret,
-                "password": password,   # OKX 必须要 password/passphrase
-                "enableRateLimit": True,
-            }
-        )
-
-        # 模拟盘：启用 sandbox 模式
-        if env == Env.TEST:
-            try:
-                exchange.set_sandbox_mode(True)
-            except Exception:
-                # 如果版本不支持 sandbox，就忽略（到时下单会直接报错，我们再看具体问题）
-                pass
-
-        return exchange
-
-    def _choose_client(self, env: Env):
-        if env == Env.TEST:
-            return self._paper
-        else:
-            return self._live
-
-    # ---------- 下单主入口 ----------
-
-    def place_order(self, req: OrderRequest) -> OrderResult:
-        client = self._choose_client(req.env)
-
-        if client is None:
-            return OrderResult(
-                success=False,
-                env=req.env,
-                market=req.market,
-                symbol=req.symbol,
-                side=req.side,
-                amount=req.amount,
-                price=req.price,
-                leverage=req.leverage,
-                position_side=req.position_side,
-                order_id=None,
-                raw={},
-                error="对应环境没有配置完整的 OKX API（apiKey/secret/password）",
-            )
-
+    def _create_order(
+        self,
+        client: ccxt.Exchange,
+        req: OrderRequest,
+        is_futures: bool,
+    ) -> Dict[str, Any]:
+        """
+        统一的下单逻辑，spot / futures 用不同参数。
+        """
         order_type = "market" if req.price is None else "limit"
-
         params: Dict[str, Any] = {}
 
-        # 合约相关参数
-        if req.market == MarketType.FUTURES:
-            # 保证金模式：统一用全仓 cross
+        if is_futures:
+            # 统一使用全仓保证金
             params["tdMode"] = "cross"
 
-            # 单向持仓模式下，不传 posSide，直接用 side=buy/sell 控制方向
-            # buy：开多或平空；sell：开空或平多，由 OKX 自己判断
-
+            # 单向持仓模式下，不强制传 posSide，由 OKX 自己判断开多/开空/平仓
             if req.reduce_only:
                 params["reduceOnly"] = True
 
-            # 设置杠杆（不区分多空）
+            # 设置杠杆（失败就忽略，用默认杠杆）
             if req.leverage is not None:
                 try:
                     client.set_leverage(
@@ -172,54 +128,41 @@ class Trader:
                         params={"mgnMode": "cross"},
                     )
                 except Exception:
-                    # 失败就用默认杠杆
                     pass
 
-        try:
-            order = client.create_order(
-                symbol=req.symbol,
-                type=order_type,
-                side=req.side.value,
-                amount=req.amount,
-                price=None if order_type == "market" else req.price,
-                params=params,
-            )
-            order_id = order.get("id") or order.get("orderId")
+        return client.create_order(
+            symbol=req.symbol,
+            type=order_type,
+            side=req.side.value,
+            amount=req.amount,
+            price=None if order_type == "market" else req.price,
+            params=params,
+        )
 
-            return OrderResult(
-                success=True,
-                env=req.env,
-                market=req.market,
-                symbol=req.symbol,
-                side=req.side,
-                amount=req.amount,
-                price=req.price,
-                leverage=req.leverage,
-                position_side=req.position_side,
-                order_id=order_id,
-                raw=order,
-                error=None,
-            )
-        except Exception as e:
-            return OrderResult(
-                success=False,
-                env=req.env,
-                market=req.market,
-                symbol=req.symbol,
-                side=req.side,
-                amount=req.amount,
-                price=req.price,
-                leverage=req.leverage,
-                position_side=req.position_side,
-                order_id=None,
-                raw={},
-                error=str(e),
-            )
+    def place_spot_order(self, req: OrderRequest) -> Dict[str, Any]:
+        if req.market != MarketType.SPOT:
+            raise ValueError("place_spot_order 只支持现货订单 (market=SPOT)")
+        return self._create_order(self.spot, req, is_futures=False)
 
-    # ---------- 给企业微信用的精简文本 ----------
+    def place_futures_order(self, req: OrderRequest) -> Dict[str, Any]:
+        if req.market != MarketType.FUTURES:
+            raise ValueError("place_futures_order 只支持合约订单 (market=FUTURES)")
+        return self._create_order(self.futures, req, is_futures=True)
+
+    # 兼容一个通用入口（如果你后面想用的话）
+    def place_order(self, req: OrderRequest) -> Dict[str, Any]:
+        if req.market == MarketType.SPOT:
+            return self.place_spot_order(req)
+        else:
+            return self.place_futures_order(req)
+
+    # ---------- 给企业微信用的精简文本（目前 main.py 未使用，先保留） ----------
 
     @staticmethod
-    def format_wecom_message(req: OrderRequest, res: OrderResult) -> str:
+    def format_wecom_message(
+        req: OrderRequest,
+        res: OrderResult,
+    ) -> str:
         env_tag = "DEMO" if req.env == Env.TEST else "LIVE"
         market_tag = "现货" if req.market == MarketType.SPOT else "合约"
 
