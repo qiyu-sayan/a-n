@@ -16,6 +16,8 @@ jobs:
       OKX_LIVE_API_SECRET: ${{ secrets.OKX_LIVE_API_SECRET }}
       OKX_LIVE_API_PASSPHRASE: ${{ secrets.OKX_LIVE_API_PASSPHRASE }}
 
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -27,9 +29,9 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install ccxt
+          pip install ccxt requests
           pip install -r requirements.txt || true
 
-      - name: Run OKX test trader (demo spot + futures)
+      - name: Run OKX test trader (demo spot + futures + WeCom)
         run: |
           python -m tools.test_trader_import
