@@ -3,7 +3,7 @@ name: run-bot
 on:
   # 定时任务（示例：每 30 分钟跑一次，你可以按需修改 cron）
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"
 
   # 手动触发方便调试
   workflow_dispatch:
