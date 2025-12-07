@@ -24,7 +24,6 @@
     * DEMO: 固定单笔名义金额上限 (MAX_*_NOTIONAL_TEST)
     * LIVE: 单笔名义金额上限 (MAX_*_NOTIONAL_LIVE) + 按总余额比例控制 (LIVE_RISK_PER_TRADE)
     * 名义金额 = amount * last_price（按你平时开 100U 的方式来算）
-    -> 我们只按「预期 U 金额」当作 U 金额，不再折腾 contractSize
 """
 
 from __future__ import annotations
@@ -80,33 +79,42 @@ TRADE_LOG_PATH = "logs/trades.csv"
 
 
 # =============================
-# 工具函数：行情 / 名义金额
+# 工具函数：OKX 账号 / 行情 / 名义金额
 # =============================
 
-def _load_okx_env(env: Env) -> Tuple[str, str]:
+def _load_okx_env(env: Env) -> Tuple[str, str, str]:
+    """
+    返回 (api_key, api_secret, passphrase)
+
+    注意这里直接用你 run-bot.yml 里已经有的两个 Secret：
+    - OKX_PAPER_API_PASSPHRASE
+    - OKX_LIVE_API_PASSPHRASE
+    """
     if env == Env.TEST:
         key = os.environ["OKX_PAPER_API_KEY"]
         secret = os.environ["OKX_PAPER_API_SECRET"]
+        passphrase = os.environ["OKX_PAPER_API_PASSPHRASE"]
     else:
         key = os.environ["OKX_LIVE_API_KEY"]
         secret = os.environ["OKX_LIVE_API_SECRET"]
-    return key, secret
+        passphrase = os.environ["OKX_LIVE_API_PASSPHRASE"]
+    return key, secret, passphrase
 
 
 def _create_exchanges(env: Env) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
-    api_key, api_secret = _load_okx_env(env)
+    api_key, api_secret, passphrase = _load_okx_env(env)
 
     # 现货
     spot = ccxt.okx({
         "apiKey": api_key,
         "secret": api_secret,
-        "password": os.environ["OKX_API_PASSWORD"],
+        "password": passphrase,
     })
     # 永续合约
     futures = ccxt.okx({
         "apiKey": api_key,
         "secret": api_secret,
-        "password": os.environ["OKX_API_PASSWORD"],
+        "password": passphrase,
     })
 
     if env == Env.TEST:
@@ -135,12 +143,10 @@ def _estimate_notional(
     amount: float,
 ) -> float:
     try:
-        if market == MarketType.SPOT:
-            m = ex.market(symbol)
-            price = float(m["info"]["tickSz"]) if "tickSz" in m.get("info", {}) else float(m["info"].get("last", 0))
-        else:
-            m = ex.market(symbol)
-            price = float(m["info"].get("last", 0)) or float(m["info"].get("idxPx", 0))
+        m = ex.market(symbol)
+        info = m.get("info", {})
+        # 价格优先用 last / idxPx，如果没有就退而求其次
+        price = float(info.get("last") or info.get("idxPx") or 0.0)
         return abs(amount) * price
     except Exception as e:
         print(f"[main] 预估名义金额失败 ({symbol}): {e}")
@@ -175,11 +181,12 @@ def _generate_futures_close_orders(
 
     for pos in positions:
         try:
-            symbol = pos.get("symbol") or pos.get("info", {}).get("instId")
+            info = pos.get("info", {})
+            symbol = pos.get("symbol") or info.get("instId")
             if not symbol:
                 continue
 
-            side_str = pos.get("side") or pos.get("info", {}).get("posSide")
+            side_str = pos.get("side") or info.get("posSide")
             if not side_str:
                 continue
 
@@ -193,6 +200,7 @@ def _generate_futures_close_orders(
             else:
                 continue
 
+            # 这里直接用名义价值（或仓位张数 * 标记价），不同账户略有差异
             notional = float(pos.get("notional", 0) or pos.get("contracts", 0))
             if notional <= 0:
                 continue
@@ -215,6 +223,10 @@ def _generate_futures_close_orders(
             else:
                 continue
 
+            amount = abs(float(pos.get("contracts", 0) or info.get("pos", 0)))
+            if amount <= 0:
+                continue
+
             close_orders.append(
                 OrderRequest(
                     env=env,
@@ -222,7 +234,7 @@ def _generate_futures_close_orders(
                     symbol=symbol,
                     side=side,
                     position_side=pos_side,
-                    amount=abs(float(pos.get("contracts", 0) or pos.get("info", {}).get("pos", 0))),
+                    amount=amount,
                     leverage=None,
                     reduce_only=True,
                     reason=reason,
@@ -362,25 +374,6 @@ def _format_wecom_message(
     return "\n".join(lines)
 
 
-def _send_batch_wecom_message(env: Env, messages: List[str]) -> None:
-    """把本轮执行结果 + 最近 24 小时战报，一起发到企业微信。"""
-    header_env = "DEMO（OKX 模拟盘）" if env == Env.TEST else "LIVE（OKX 实盘）"
-
-    sections: List[str] = []
-    sections.append("### 交易机器人执行结果 - " + header_env)
-
-    if messages:
-        sections.append("\n".join(messages))
-
-    # 追加 24 小时简易战报
-    report = _build_recent_report(env, hours=24)
-    sections.append("### 近 24 小时策略战报")
-    sections.append(report)
-
-    text = "\n\n".join(sections)
-    send_wecom_message(text)
-
-
 def _append_trade_log(
     env: Env,
     req: OrderRequest,
@@ -497,6 +490,25 @@ def _build_recent_report(env: Env, hours: int = 24) -> str:
     return "\n".join(lines)
 
 
+def _send_batch_wecom_message(env: Env, messages: List[str]) -> None:
+    """把本轮执行结果 + 最近 24 小时战报，一起发到企业微信。"""
+    header_env = "DEMO（OKX 模拟盘）" if env == Env.TEST else "LIVE（OKX 实盘）"
+
+    sections: List[str] = []
+    sections.append("### 交易机器人执行结果 - " + header_env)
+
+    if messages:
+        sections.append("\n".join(messages))
+
+    # 追加 24 小时简易战报
+    report = _build_recent_report(env, hours=24)
+    sections.append("### 近 24 小时策略战报")
+    sections.append(report)
+
+    text = "\n\n".join(sections)
+    send_wecom_message(text)
+
+
 # =============================
 # LIVE 环境安全检查
 # =============================
@@ -531,7 +543,8 @@ def run_once(env: Env) -> None:
     spot_ex, fut_ex = _create_exchanges(env)
     _load_markets(spot_ex, fut_ex)
 
-    trader = Trader(env=env, spot=spot_ex, futures=fut_ex)
+    # 这里用“位置参数”创建 Trader，避免 env 关键字报错
+    trader = Trader(env, spot_ex, fut_ex)
 
     if env == Env.LIVE:
         if not _run_live_sanity_checks(spot_ex, fut_ex):
@@ -592,6 +605,7 @@ def run_once(env: Env) -> None:
 
 
 if __name__ == "__main__":
-    env_str = os.getenv("ENV", "test").lower()
+    # 同时兼容 ENV / BOT_ENV 两种环境变量
+    env_str = (os.getenv("ENV") or os.getenv("BOT_ENV") or "test").lower()
     env = Env.TEST if env_str == "test" else Env.LIVE
     run_once(env)
