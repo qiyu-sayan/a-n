@@ -30,6 +30,7 @@ jobs:
 
       # 企业微信机器人 Webhook
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      OKX_API_PASSWORD: ${{ secrets.OKX_API_PASSWORD }}
 
     steps:
       - name: Checkout repo
