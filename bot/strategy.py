@@ -27,7 +27,7 @@ from bot.trader import (
 # 全局开关 & 参数
 # =============================
 
-ENABLE_SPOT = True
+ENABLE_SPOT = False
 ENABLE_FUTURES = True
 
 TREND_TF = "4h"
