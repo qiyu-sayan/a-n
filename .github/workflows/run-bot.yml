@@ -1,50 +1,46 @@
 name: run-bot
 
 on:
-  # 定时任务（示例：每 30 分钟跑一次，你可以按需修改 cron）
   schedule:
-    - cron: "*/15 * * * *"
-
-  # 手动触发方便调试
+    - cron: "*/15 * * * *"   # 每 15 分钟运行一次
   workflow_dispatch:
 
 jobs:
-  trade:
-    runs-on: self-hosted
+  run-bot:
+    runs-on: self-hosted   # 你现在就是用自托管 runner，就保持不变
 
     env:
-      # 运行环境：
-      #   test -> 使用 OKX 模拟盘（DEMO）
-      #   live -> 使用 OKX 实盘
-      BOT_ENV: test
+      BOT_ENV: test   # 模拟盘：test，实盘以后改成 live
 
-      # OKX 模拟盘（Paper Trading）API（你已经在 Secrets 里配好了）
+      # 下单金额控制（名义金额），比如每单 10U
+      ORDER_USDT: ${{ secrets.ORDER_USDT }}
+
+      # OKX 模拟盘 API
       OKX_PAPER_API_KEY: ${{ secrets.OKX_PAPER_API_KEY }}
       OKX_PAPER_API_SECRET: ${{ secrets.OKX_PAPER_API_SECRET }}
       OKX_PAPER_API_PASSPHRASE: ${{ secrets.OKX_PAPER_API_PASSPHRASE }}
 
-      # OKX 实盘 API（目前可以为空，将来上实盘再配置）
+      # OKX 实盘 API（现在用不到，但先保留）
       OKX_LIVE_API_KEY: ${{ secrets.OKX_LIVE_API_KEY }}
       OKX_LIVE_API_SECRET: ${{ secrets.OKX_LIVE_API_SECRET }}
       OKX_LIVE_API_PASSPHRASE: ${{ secrets.OKX_LIVE_API_PASSPHRASE }}
 
-      # 企业微信机器人 Webhook
-      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      # 企业微信机器人 key（保持和你原来的一样）
+      WECOM_BOT_KEY: ${{ secrets.WECOM_BOT_KEY }}
 
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          pip install ccxt requests
-          pip install -r requirements.txt || true
+          pip install -r requirements.txt
 
-      - name: Run trading bot
+      - name: Run bot
         run: |
           python -m bot.main
