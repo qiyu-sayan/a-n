@@ -1,21 +1,25 @@
 # bot/strategy.py
 """
-策略模块（你可以在这里组合多种策略）
+混合策略系统（现货 + 合约 + 多周期）
+-----------------------------------
 
-目标：
-- 同时支持现货 & 合约（你在问题 1 里选了 C）
-- 预留 K 线策略 / 你自己的旧策略 / 手工测试单的组合空间
-- 默认行为：不下单（保证安全）
+这是一个专业级策略框架模板，用来构建你的自动交易系统。
 
-核心对外接口：
-    generate_orders(env: Env) -> list[OrderRequest]
+特性：
+- 同时支持：现货 + 合约
+- 多周期分析：trend_tf 决定方向、entry_tf 决定入场
+- 策略可组合（每个策略模块独立）
+- 默认不下单（安全模式）
+- 可以把任何策略逻辑（MA/RSI/结构/突破）插入到模板中
 
-后续你想改策略，只需要改这个文件，不需要动 main.py / trader.py。
+你未来的所有策略只需要在本文件内扩展。
+主流程 main.py 与交易逻辑完全解耦。
 """
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional, Dict, Any
+import ccxt
 
 from bot.trader import (
     Env,
@@ -25,154 +29,171 @@ from bot.trader import (
     OrderRequest,
 )
 
-# ===================== 策略开关（很重要） =====================
+# =============================
+# 参数区（策略全局控制中心）
+# =============================
 
-# 你可以按需要打开/关闭不同策略模块
-ENABLE_SPOT_STRATEGY = False      # 现货 K 线策略
-ENABLE_FUTURES_STRATEGY = False   # 合约 K 线 / 多空策略
-ENABLE_MANUAL_TEST = False        # 手工测试单 / 旧逻辑迁移区
+# 策略开关
+ENABLE_SPOT = False
+ENABLE_FUTURES = False
+
+# 多周期
+TREND_TF = "4h"   # 趋势方向周期
+ENTRY_TF = "1h"   # 入场周期
+
+# 要交易的币（可扩展多个）
+SPOT_SYMBOLS = ["BTC/USDT"]
+FUTURES_SYMBOLS = ["BTC/USDT:USDT"]
 
 
-# ===================== 对外主入口 =====================
+# =============================
+# 工具函数：获取 K 线
+# =============================
+
+def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 100):
+    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+
+def get_exchange():
+    ex = ccxt.okx()
+    ex.options["defaultType"] = "swap"  # 合约默认
+    return ex
+
+
+# =============================
+# 主入口：外部调用 generate_orders(env)
+# =============================
 
 def generate_orders(env: Env) -> List[OrderRequest]:
     """
-    生成本次要执行的所有订单（现货 + 合约混合）。
-
-    当前默认逻辑：
-        - 所有策略开关默认是 False，所以返回 []（不下单）
-        - 你可以逐个把开关改成 True，调试各自的策略模块。
+    返回本次全部订单（现货 + 合约），为空则 main.py 不会下单。
     """
     orders: List[OrderRequest] = []
 
-    if ENABLE_SPOT_STRATEGY:
-        orders.extend(_spot_kline_strategy(env))
+    if ENABLE_SPOT:
+        orders.extend(run_spot_strategy(env))
 
-    if ENABLE_FUTURES_STRATEGY:
-        orders.extend(_futures_kline_strategy(env))
-
-    if ENABLE_MANUAL_TEST:
-        orders.extend(_manual_or_legacy_strategy(env))
+    if ENABLE_FUTURES:
+        orders.extend(run_futures_strategy(env))
 
     return orders
 
 
-# ===================== 现货 K 线策略（占位） =====================
+# =============================
+# 现货混合策略（模板）
+# =============================
 
-def _spot_kline_strategy(env: Env) -> List[OrderRequest]:
+def run_spot_strategy(env: Env) -> List[OrderRequest]:
+    exchange = get_exchange()
+    results: List[OrderRequest] = []
+
+    for symbol in SPOT_SYMBOLS:
+        try:
+            trend = fetch_ohlcv(exchange, symbol, TREND_TF)
+            entry = fetch_ohlcv(exchange, symbol, ENTRY_TF)
+
+            direction = detect_trend_direction(trend)
+            entry_signal = detect_entry_signal(entry, direction)
+
+            if entry_signal is None:
+                continue
+
+            order = OrderRequest(
+                env=env,
+                market=MarketType.SPOT,
+                symbol=symbol,
+                side=entry_signal,
+                amount=0.001,
+                price=None,
+                leverage=None,
+                position_side=None,
+                reason=f"现货混合策略：趋势={direction}, 入场信号={entry_signal.value}",
+            )
+            results.append(order)
+
+        except Exception as e:
+            print(f"[SPOT] {symbol} 策略错误：{e}")
+
+    return results
+
+
+# =============================
+# 合约混合策略（模板）
+# =============================
+
+def run_futures_strategy(env: Env) -> List[OrderRequest]:
+    exchange = get_exchange()
+    results: List[OrderRequest] = []
+
+    for symbol in FUTURES_SYMBOLS:
+        try:
+            trend = fetch_ohlcv(exchange, symbol, TREND_TF)
+            entry = fetch_ohlcv(exchange, symbol, ENTRY_TF)
+
+            direction = detect_trend_direction(trend)
+            entry_signal = detect_entry_signal(entry, direction)
+
+            if entry_signal is None:
+                continue
+
+            order = OrderRequest(
+                env=env,
+                market=MarketType.FUTURES,
+                symbol=symbol,
+                side=entry_signal,
+                amount=1,
+                price=None,
+                leverage=3,
+                position_side=None,  # 单向模式
+                reason=f"合约混合策略：趋势={direction}, 入场信号={entry_signal.value}",
+            )
+            results.append(order)
+
+        except Exception as e:
+            print(f"[FUTURES] {symbol} 策略错误：{e}")
+
+    return results
+
+
+# =============================
+# 趋势方向检测（模板，可扩展）
+# =============================
+
+def detect_trend_direction(trend_kline: List[List[Any]]) -> str:
     """
-    这里预留给“现货 K 线策略”，例如：
-        - MA5 上穿 MA20 买入
-        - RSI 超卖反弹买入
-        - etc.
-
-    目前只是模板，默认不生成任何订单。
-    你以后可以在这里用 ccxt.okx().fetch_ohlcv(...) 拉 K 线，然后生成 OrderRequest。
+    返回：
+        "up"   → 看多趋势
+        "down" → 看空趋势
+        "flat" → 震荡，不做单
+    默认使用 MA 指标做示例逻辑，但不会触发下单（因为 entry_signal 默认返回 None）
     """
-    signals: List[OrderRequest] = []
+    closes = [c[4] for c in trend_kline]
 
-    # 示例（伪代码，默认注释掉）：
-    #
-    # import ccxt
-    # okx = ccxt.okx()
-    # ohlcv = okx.fetch_ohlcv("BTC/USDT", timeframe="1h", limit=100)
-    # ... 计算策略 ...
-    # if 出现买入信号:
-    #     signals.append(
-    #         OrderRequest(
-    #             env=env,
-    #             market=MarketType.SPOT,
-    #             symbol="BTC/USDT",
-    #             side=Side.BUY,
-    #             amount=0.001,
-    #             price=None,
-    #             leverage=None,
-    #             position_side=None,
-    #             reason="现货策略信号：XXX",
-    #         )
-    #     )
+    # 示例 MA
+    ma_fast = sum(closes[-5:]) / 5
+    ma_slow = sum(closes[-20:]) / 20
 
-    return signals
+    if ma_fast > ma_slow:
+        return "up"
+    elif ma_fast < ma_slow:
+        return "down"
+    return "flat"
 
 
-# ===================== 合约 K 线 / 多空策略（占位） =====================
+# =============================
+# 入场信号检测（模板，可扩展）
+# =============================
 
-def _futures_kline_strategy(env: Env) -> List[OrderRequest]:
+def detect_entry_signal(entry_kline: List[List[Any]], trend: str) -> Optional[Side]:
     """
-    这里预留给“合约策略”，例如：
-        - 趋势跟随：突破区间上沿开多，跌破下沿开空
-        - HL/HH 结构判断多空
-        - etc.
+    返回：
+        Side.BUY    → 开多
+        Side.SELL   → 开空
+        None        → 不下单
 
-    目前也是模板，默认不生成任何订单。
+    模板逻辑：永远返回 None（安全）
+    你未来可以自己加信号，例如：
+        • 趋势为 up 且收出强势多头信号 → BUY
+        • 趋势为 down 且收盘跌破区间 → SELL
     """
-    signals: List[OrderRequest] = []
-
-    # 示例（伪代码）：
-    #
-    # import ccxt
-    # okx = ccxt.okx()
-    # ohlcv = okx.fetch_ohlcv("BTC/USDT:USDT", timeframe="4h", limit=200, params={"instType": "SWAP"})
-    # ... 计算多空方向 ...
-    # if 看多:
-    #     signals.append(
-    #         OrderRequest(
-    #             env=env,
-#             market=MarketType.FUTURES,
-#             symbol="BTC/USDT:USDT",
-#             side=Side.BUY,
-#             amount=1,
-#             price=None,
-#             leverage=5,
-#             position_side=None,  # 当前使用单向持仓
-#             reason="合约策略信号：看多",
-#         )
-#     )
-# elif 看空:
-#     signals.append(
-#         OrderRequest(
-#             env=env,
-#             market=MarketType.FUTURES,
-#             symbol="BTC/USDT:USDT",
-#             side=Side.SELL,
-#             amount=1,
-#             price=None,
-#             leverage=5,
-#             position_side=None,
-#             reason="合约策略信号：看空",
-#         )
-#     )
-
-    return signals
-
-
-# ===================== 手工 / 旧逻辑策略（占位） =====================
-
-def _manual_or_legacy_strategy(env: Env) -> List[OrderRequest]:
-    """
-    这里是给你：
-        - 手工测试单
-        - 以前 main_old.py / 老 strategy 的迁移逻辑
-
-    你可以在这里硬编码一些订单，方便调试整条链路。
-    """
-    signals: List[OrderRequest] = []
-
-    # 示例：如果你想测试一下“每次跑都在 DEMO 合约开 1 张多单”，
-    # 只需要把 ENABLE_MANUAL_TEST 改成 True，然后取消下面注释。
-    #
-    # signals.append(
-    #     OrderRequest(
-    #         env=env,
-    #         market=MarketType.FUTURES,
-    #         symbol="BTC/USDT:USDT",
-    #         side=Side.BUY,
-    #         amount=1,
-    #         price=None,
-    #         leverage=3,
-    #         position_side=None,
-    #         reason="手工测试单：DEMO 合约开多 1 张",
-    #     )
-    # )
-
-    return signals
+    return None
