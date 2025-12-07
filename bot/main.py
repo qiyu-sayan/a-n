@@ -501,7 +501,7 @@ def _send_batch_wecom_message(env: Env, orders: List[OrderRequest], messages: Li
 def run_once() -> None:
     env = _load_env()
     trader = _build_trader()
-    spot_ex, fut_ex = _build_okx_clients()
+    spot_ex, fut_ex = _build_okx_clients(env)
 
     print(f"[main] 运行环境: {env.value}")
 
