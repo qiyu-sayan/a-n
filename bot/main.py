@@ -91,11 +91,42 @@ def _build_trader() -> Trader:
 # OKX 客户端（给风控 & 持仓管理用）
 # =============================
 
-def _build_okx_clients() -> Tuple[ccxt.Exchange, ccxt.Exchange]:
-    spot = ccxt.okx()
+def _build_okx_clients(env: Env) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
+    """
+    创建带密钥的 OKX ccxt 客户端：
+    - TEST 环境：使用 OKX_PAPER_xxx，并加上 x-simulated-trading 头，访问模拟盘
+    - LIVE 环境：使用 OKX_LIVE_xxx，访问实盘
+    """
+    if env == Env.TEST:
+        api_key = os.getenv("OKX_PAPER_API_KEY")
+        secret = os.getenv("OKX_PAPER_API_SECRET")
+        password = os.getenv("OKX_PAPER_API_PASSPHRASE")
+        cfg = {
+            "apiKey": api_key,
+            "secret": secret,
+            "password": password,
+            # OKX 模拟盘需要这个头
+            "headers": {"x-simulated-trading": "1"},
+        }
+    else:
+        api_key = os.getenv("OKX_LIVE_API_KEY")
+        secret = os.getenv("OKX_LIVE_API_SECRET")
+        password = os.getenv("OKX_LIVE_API_PASSPHRASE")
+        cfg = {
+            "apiKey": api_key,
+            "secret": secret,
+            "password": password,
+        }
+
+    # 简单检查一下，防止忘记填 secrets
+    if not api_key or not secret or not password:
+        print("[main] 警告: OKX API Key/Secret/Passphrase 有缺失，"
+              "余额/持仓等私有接口会失败。")
+
+    spot = ccxt.okx(cfg)
     spot.options["defaultType"] = "spot"
 
-    swap = ccxt.okx()
+    swap = ccxt.okx(cfg)
     swap.options["defaultType"] = "swap"
 
     try:
@@ -104,6 +135,7 @@ def _build_okx_clients() -> Tuple[ccxt.Exchange, ccxt.Exchange]:
         print(f"[main] 加载合约市场信息失败: {e}")
 
     return spot, swap
+
 
 
 def _fetch_usdt_balance(spot_ex: ccxt.Exchange) -> Tuple[float, float]:
