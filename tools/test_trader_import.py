@@ -63,9 +63,10 @@ def main() -> None:
         amount=1,                   # 合约张数，余额不多可减小
         price=None,                 # 市价
         leverage=5,
-        position_side=PositionSide.LONG,
+        position_side=None,         # 单向持仓模式，不再传 posSide
         reason="DEMO 合约开多验证",
     )
+
     futures_res = trader.place_order(futures_req)
     print("=== 合约结果 ===")
     print(Trader.format_wecom_message(futures_req, futures_res))
