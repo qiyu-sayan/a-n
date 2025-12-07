@@ -19,15 +19,13 @@ from bot.trader import (
 # =============================
 
 # 需要交易的合约品种（OKX 永续）
-# 如果以后想增删，只改这里即可
 FUTURE_SYMBOLS = [
     "ETH-USDT-SWAP",
     "BTC-USDT-SWAP",
-    "ZEC-USDT-SWAP",
-    "ASTR-USDT-SWAP",  # 你说的 aster，这边按 OKX 上的 ASTR-USDT-SWAP 写
 ]
 
 # 使用的 K 线周期，默认 4 小时
+# 机器人每 15 分钟跑一次，但信号仍然基于 4h 级别
 TIMEFRAME = os.getenv("STRAT_TIMEFRAME", "4h")
 
 # 单笔目标名义金额（USDT），默认跟 main.py 里的 ORDER_USDT 一致
@@ -59,7 +57,6 @@ def _ema(values: List[float], period: int) -> List[float]:
     for v in values[1:]:
         ema_vals.append(alpha * v + (1 - alpha) * ema_vals[-1])
 
-    # 为了方便，只要长度一致即可
     return ema_vals
 
 
@@ -156,8 +153,8 @@ def generate_orders(trader: Trader) -> List[OrderRequest]:
 
     当前逻辑：
     - 只做 OKX 合约（SWAP）
-    - 4 小时 K 线
-    - 对每个设定好的品种：
+    - 使用 4 小时 K 线做趋势+放量判断
+    - 对 ETH / BTC 两个品种分别：
         * 计算 EMA20 / EMA50
         * 判断是否处于趋势行情（多 / 空）
         * 判断是否有“放量突破 / 跌破”
