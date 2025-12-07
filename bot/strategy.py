@@ -266,21 +266,16 @@ def detect_entry_signal(entry_kline: List[List[Any]], trend: str) -> Tuple[Optio
 def decide_leverage(trend_strength: float, move_ratio: float) -> Tuple[str, int]:
     """
     根据趋势强度和入场动量决定杠杆：
-        - weak   -> 1~3x
-        - normal -> 3~7x
-        - strong -> 7~15x
-        - ultra  -> 15~20x
-
-    这里只控制“理论杠杆”，实际名义金额在 main.py 控制，
-    LIVE 环境目前不会下单，将来会上额外的杠杆上限。
+        - weak   -> 2x
+        - normal -> 4x
+        - strong -> 8x
+        - ultra  -> 15x
     """
-    # 把强度标准化到 MIN 的倍数
     ts = trend_strength / (MIN_TREND_STRENGTH + 1e-9)
     mv = move_ratio / (MIN_ENTRY_MOVE + 1e-9)
 
     score = (ts + mv) / 2  # 简单平均
 
-    # 经验分段，后续可以根据回测结果再调
     if score < 2:
         level = "weak"
         lev = 2
@@ -294,6 +289,5 @@ def decide_leverage(trend_strength: float, move_ratio: float) -> Tuple[str, int]
         level = "ultra"
         lev = 15
 
-    # 限制在 [LEV_MIN, LEV_MAX]
     lev = max(LEV_MIN, min(lev, LEV_MAX))
     return level, lev
