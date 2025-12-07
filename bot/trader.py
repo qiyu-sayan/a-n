@@ -9,13 +9,13 @@ import ccxt
 
 
 class Env(str, Enum):
-    TEST = "test"   # 这里的 TEST = Binance Demo Trading
-    LIVE = "live"   # 将来接实盘用
+    TEST = "test"   # 用 OKX 模拟盘（sandbox）
+    LIVE = "live"   # 用 OKX 实盘
 
 
 class MarketType(str, Enum):
     SPOT = "spot"
-    FUTURES = "futures"
+    FUTURES = "futures"   # 这里指永续/合约（swap）
 
 
 class Side(str, Enum):
@@ -31,16 +31,16 @@ class PositionSide(str, Enum):
 @dataclass
 class OrderRequest:
     """
-    上层只需要构造这个对象丢给 Trader
+    机器人上层只需要构造这个对象丢给 Trader 下单。
     """
     env: Env
     market: MarketType
     symbol: str
     side: Side
     amount: float
-    price: Optional[float]                 # None = 市价
+    price: Optional[float]                 # None = 市价单
     leverage: Optional[int] = None        # 合约用
-    position_side: Optional[PositionSide] = None  # 合约用
+    position_side: Optional[PositionSide] = None  # 合约用（多/空）
     reduce_only: bool = False             # 合约平仓用
     reason: str = ""                      # 人类可读原因，方便推送
 
@@ -66,102 +66,71 @@ class OrderResult:
 
 class Trader:
     """
-    统一的交易引擎：
+    统一的 OKX 交易引擎。
 
-    - Env.TEST  = Binance Demo Trading（现货 + 合约用同一套 demo key）
-    - Env.LIVE  = 将来接正式实盘
+    - Env.TEST 使用 OKX 模拟盘（sandbox），读 OKX_PAPER_* 这一套 key
+    - Env.LIVE 使用 OKX 实盘，读 OKX_LIVE_* 这一套 key
 
-    你现在只需要一套 demo API，就可以同时下现货和合约单。
+    OKX 是统一账户，所以 demo/live 各只需要 1 组 key，
+    现货和合约可以共用同一组 key。
     """
 
     def __init__(
         self,
         exchange_id: str,
-        demo_keys: Dict[str, str],
-        live_spot_keys: Optional[Dict[str, str]] = None,
-        live_futures_keys: Optional[Dict[str, str]] = None,
+        paper_keys: Dict[str, str],
+        live_keys: Dict[str, str],
     ) -> None:
+        if exchange_id != "okx":
+            # 目前专门为 OKX 写的，后面若要扩展再说
+            raise ValueError("当前 Trader 仅支持 exchange_id='okx'")
+
         self.exchange_id = exchange_id
 
-        live_spot_keys = live_spot_keys or {}
-        live_futures_keys = live_futures_keys or {}
+        self._paper = self._create_client(paper_keys, Env.TEST)
+        self._live = self._create_client(live_keys, Env.LIVE)
 
-        # Demo：现货 + 合约共用一套 key
-        self._spot_demo = self._create_client(demo_keys, MarketType.SPOT, Env.TEST)
-        self._futures_demo = self._create_client(demo_keys, MarketType.FUTURES, Env.TEST)
+    # ---------- 内部：创建 ccxt client ----------
 
-        # Live：为以后接实盘预留
-        self._spot_live = self._create_client(live_spot_keys, MarketType.SPOT, Env.LIVE)
-        self._futures_live = self._create_client(live_futures_keys, MarketType.FUTURES, Env.LIVE)
+    def _create_client(self, keys: Dict[str, str], env: Env):
+        api_key = keys.get("apiKey")
+        secret = keys.get("secret")
+        password = keys.get("password")
 
-    # ---------- 内部：创建 client ----------
-
-    def _create_client(
-        self,
-        keys: Dict[str, str],
-        market_type: MarketType,
-        env: Env,
-    ):
-        if not keys or not keys.get("apiKey"):
+        if not api_key or not secret or not password:
+            # 没配完整就返回 None，上层会优雅失败
             return None
 
         exchange_class = getattr(ccxt, self.exchange_id)
         exchange = exchange_class(
             {
-                "apiKey": keys.get("apiKey"),
-                "secret": keys.get("secret"),
+                "apiKey": api_key,
+                "secret": secret,
+                "password": password,   # OKX 必须要 password/passphrase
                 "enableRateLimit": True,
             }
         )
 
-        # === Binance Demo Trading 特殊处理 ===
-        # 官方文档：Demo Trading 提供独立的 Spot / Futures 域名 :contentReference[oaicite:0]{index=0}
-        if self.exchange_id == "binance" and env == Env.TEST:
-            if market_type == MarketType.SPOT:
-                # Spot Demo base: https://demo-api.binance.com
-                urls = exchange.urls
-                urls["api"] = "https://demo-api.binance.com/api"
-                urls["sapi"] = "https://demo-api.binance.com/sapi"
-                exchange.urls = urls
-                exchange.options["defaultType"] = "spot"
-            else:
-                # Futures Demo base: https://demo-fapi.binance.com
-                urls = exchange.urls
-                urls["fapi"] = "https://demo-fapi.binance.com/fapi"
-                urls["fapiPublic"] = "https://demo-fapi.binance.com/fapi"
-                urls["fapiPrivate"] = "https://demo-fapi.binance.com/fapi"
-                exchange.urls = urls
-                exchange.options["defaultType"] = "future"
-
-                # 尝试开启 hedge 模式（允许 LONG/SHORT）
-                try:
-                    exchange.set_position_mode(True)
-                except Exception:
-                    pass
-
-            return exchange
-
-        # === 其它情况（包括将来实盘 or 其它交易所） ===
-        if market_type == MarketType.SPOT:
-            exchange.options["defaultType"] = "spot"
-        else:
-            if self.exchange_id == "binance":
-                exchange.options["defaultType"] = "future"
-            else:
-                exchange.options["defaultType"] = "swap"
+        # 模拟盘：启用 sandbox 模式
+        if env == Env.TEST:
+            try:
+                exchange.set_sandbox_mode(True)
+            except Exception:
+                # 如果版本不支持 sandbox，就忽略（到时下单会直接报错，我们再看具体问题）
+                pass
 
         return exchange
 
-    def _choose_client(self, env: Env, market: MarketType):
+    def _choose_client(self, env: Env):
         if env == Env.TEST:
-            return self._spot_demo if market == MarketType.SPOT else self._futures_demo
+            return self._paper
         else:
-            return self._spot_live if market == MarketType.SPOT else self._futures_live
+            return self._live
 
     # ---------- 下单主入口 ----------
 
     def place_order(self, req: OrderRequest) -> OrderResult:
-        client = self._choose_client(req.env, req.market)
+        client = self._choose_client(req.env)
 
         if client is None:
             return OrderResult(
@@ -176,22 +145,36 @@ class Trader:
                 position_side=req.position_side,
                 order_id=None,
                 raw={},
-                error="对应环境/市场没有配置 API Key（client 为 None）",
+                error="对应环境没有配置完整的 OKX API（apiKey/secret/password）",
             )
 
         order_type = "market" if req.price is None else "limit"
 
         params: Dict[str, Any] = {}
 
+        # 合约相关参数
         if req.market == MarketType.FUTURES:
+            # 保证金模式：先统一用 cross（全仓），以后需要再改 isolated
+            params["tdMode"] = "cross"
+
+            # 多空方向（前提是你在 OKX 设置的是「双向持仓」模式）
             if req.position_side is not None:
-                params["positionSide"] = req.position_side.name.upper()
+                # OKX 要求小写 long/short
+                params["posSide"] = req.position_side.value
+
             if req.reduce_only:
                 params["reduceOnly"] = True
+
+            # 设置杠杆（OKX 这里比较坑，经常各种问题，所以失败就忽略）
             if req.leverage is not None:
                 try:
-                    client.set_leverage(req.leverage, req.symbol)
+                    client.set_leverage(
+                        req.leverage,
+                        req.symbol,
+                        params={"mgnMode": "cross", "posSide": params.get("posSide")},
+                    )
                 except Exception:
+                    # 失败了也不要影响下单，OKX 默认杠杆即可
                     pass
 
         try:
@@ -204,6 +187,7 @@ class Trader:
                 params=params,
             )
             order_id = order.get("id") or order.get("orderId")
+
             return OrderResult(
                 success=True,
                 env=req.env,
