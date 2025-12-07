@@ -154,27 +154,25 @@ class Trader:
 
         # 合约相关参数
         if req.market == MarketType.FUTURES:
-            # 保证金模式：先统一用 cross（全仓），以后需要再改 isolated
+            # 保证金模式：统一用全仓 cross
             params["tdMode"] = "cross"
 
-            # 多空方向（前提是你在 OKX 设置的是「双向持仓」模式）
-            if req.position_side is not None:
-                # OKX 要求小写 long/short
-                params["posSide"] = req.position_side.value
+            # 单向持仓模式下，不传 posSide，直接用 side=buy/sell 控制方向
+            # buy：开多或平空；sell：开空或平多，由 OKX 自己判断
 
             if req.reduce_only:
                 params["reduceOnly"] = True
 
-            # 设置杠杆（OKX 这里比较坑，经常各种问题，所以失败就忽略）
+            # 设置杠杆（不区分多空）
             if req.leverage is not None:
                 try:
                     client.set_leverage(
                         req.leverage,
                         req.symbol,
-                        params={"mgnMode": "cross", "posSide": params.get("posSide")},
+                        params={"mgnMode": "cross"},
                     )
                 except Exception:
-                    # 失败了也不要影响下单，OKX 默认杠杆即可
+                    # 失败就用默认杠杆
                     pass
 
         try:
