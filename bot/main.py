@@ -2,14 +2,19 @@
 """
 交易机器人主入口（OKX + 企业微信）
 
-职责：
-- 根据 BOT_ENV 选择 DEMO / LIVE
-- 初始化 OKX Trader
-- 先检查合约持仓是否触发止盈 / 止损 -> 生成平仓订单
-- 调用策略生成新的开仓订单
-- 应用基础风控（包括名义金额 ≈ 10 USDT）
-- 下单
-- 把执行结果推送到企业微信（显示金额，不带订单号）
+流程：
+1. 根据 BOT_ENV 选择 DEMO / LIVE
+2. 初始化 OKX Trader + ccxt 客户端
+3. 查询 USDT 余额（total/free）
+4. 检查合约持仓，按杠杆动态止盈止损（支持分批止盈） -> 生成平仓订单（reduce_only）
+5. 如果余额过低，仅允许平仓，不再开新仓
+6. 调用策略生成新的开仓订单（现货 + 合约 + 动态杠杆）
+7. 风控：
+   - 去重
+   - 限制总单数
+   - 控制名义金额（DEMO 默认 ~20U / 单，LIVE 预留 ~10U）
+8. 下单并估算金额
+9. 推送企业微信（金额视角，不带订单号）
 """
 
 import os
@@ -27,25 +32,28 @@ from bot.wecom_notify import send_wecom_message
 from bot import strategy
 
 # =============================
-# 基础风控参数
+# 风控 & 参数
 # =============================
 
 # 每次 run-bot 最多执行多少个订单（现货+合约总和）
-MAX_ORDERS_PER_RUN = 4
+MAX_ORDERS_PER_RUN = 6
 
 # 同一市场 + 同一 symbol + 同一方向 + reduce_only，每轮只保留一单
 DEDUPE_SAME_SYMBOL_SIDE = True
 
 # 现货 / 合约 单笔最大名义金额（约，USDT）
-MAX_SPOT_NOTIONAL_USDT = 10.0
-MAX_FUTURES_NOTIONAL_USDT = 10.0
+# DEMO 用更大的名义金额加快测试，LIVE 用更小的保护本金
+MAX_SPOT_NOTIONAL_TEST = 20.0
+MAX_FUTURES_NOTIONAL_TEST = 20.0
+
+MAX_SPOT_NOTIONAL_LIVE = 10.0
+MAX_FUTURES_NOTIONAL_LIVE = 10.0
 
 # 合约单笔最大张数（再保险）
-MAX_FUTURES_CONTRACTS_PER_ORDER = 50
+MAX_FUTURES_CONTRACTS_PER_ORDER = 100
 
-# 合约止盈 / 止损阈值（百分比）
-FUTURES_TP_PCT = 0.01    # +1% 止盈
-FUTURES_SL_PCT = -0.005  # -0.5% 止损
+# 余额门槛：低于这个值时，不再开新仓，只允许平仓
+MIN_USDT_FREE_FOR_OPEN = 20.0
 
 
 # =============================
@@ -98,6 +106,61 @@ def _build_okx_clients() -> Tuple[ccxt.Exchange, ccxt.Exchange]:
     return spot, swap
 
 
+def _fetch_usdt_balance(spot_ex: ccxt.Exchange) -> Tuple[float, float]:
+    """
+    返回 (total, free) USDT 余额。
+    """
+    try:
+        bal = spot_ex.fetch_balance()
+        usdt = bal.get("USDT") or {}
+        total = float(usdt.get("total") or 0.0)
+        free = float(usdt.get("free") or 0.0)
+        return total, free
+    except Exception as e:
+        print(f"[main] 获取余额失败: {e}")
+        return 0.0, 0.0
+
+
+def _get_notional_limits(env: Env) -> Tuple[float, float]:
+    if env == Env.TEST:
+        return MAX_SPOT_NOTIONAL_TEST, MAX_FUTURES_NOTIONAL_TEST
+    else:
+        return MAX_SPOT_NOTIONAL_LIVE, MAX_FUTURES_NOTIONAL_LIVE
+
+
+# =============================
+# 根据杠杆决定 TP/SL（动态）
+# =============================
+
+def _get_tp_sl_for_leverage(leverage: float) -> Tuple[float, float, float]:
+    """
+    返回 (tp1, tp2, sl)：
+        tp1: 第一档止盈（平 50%）
+        tp2: 第二档止盈（平全部）
+        sl:  止损（平全部）
+    单位：收益率（+0.05 表示 +5%）
+    """
+    lev = max(1.0, float(leverage))
+
+    if lev <= 5:
+        # 低杠杆：止损宽，止盈更宽，适合吃趋势
+        tp1 = 0.05   # +5%
+        tp2 = 0.10   # +10%
+        sl = -0.03   # -3%
+    elif lev <= 10:
+        # 中杠杆：止损稍紧，止盈略收窄
+        tp1 = 0.04   # +4%
+        tp2 = 0.08   # +8%
+        sl = -0.02   # -2%
+    else:
+        # 高杠杆（仅 DEMO）：止损更紧，止盈相对较宽
+        tp1 = 0.03   # +3%
+        tp2 = 0.06   # +6%
+        sl = -0.015  # -1.5%
+
+    return tp1, tp2, sl
+
+
 # =============================
 # 合约自动止盈 / 止损 -> 生成平仓订单
 # =============================
@@ -105,7 +168,7 @@ def _build_okx_clients() -> Tuple[ccxt.Exchange, ccxt.Exchange]:
 def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[OrderRequest]:
     """
     检查合约持仓，如果达到止盈 / 止损条件，生成平仓订单（reduce_only = True）。
-    只在 DEMO 环境使用。
+    目前只在 DEMO 环境启用。
     """
     if env != Env.TEST:
         return []
@@ -113,7 +176,6 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
     close_orders: List[OrderRequest] = []
 
     try:
-        # OKX 合约持仓
         positions = fut_ex.fetch_positions(params={"instType": "SWAP"})
     except Exception as e:
         print(f"[main] 获取合约持仓失败: {e}")
@@ -122,17 +184,17 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
     if not positions:
         return []
 
+    from bot.trader import Side as OrderSide, MarketType, OrderRequest  # 局部导入避免循环
+
     for pos in positions:
         try:
             symbol = pos.get("symbol")
             if not symbol:
-                # 有些字段可能在 info 里
                 info = pos.get("info", {})
                 symbol = info.get("instId") or info.get("symbol")
             if not symbol:
                 continue
 
-            # 持仓数量（张数）
             size = pos.get("contracts") or pos.get("positionAmt") or pos.get("size")
             if size is None:
                 continue
@@ -140,7 +202,6 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
             if size == 0:
                 continue
 
-            # 判断多空方向
             side_raw = (pos.get("side") or pos.get("direction") or "").lower()
             if not side_raw and "posSide" in pos:
                 side_raw = str(pos["posSide"]).lower()
@@ -150,10 +211,8 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
             elif side_raw in ("short", "sell"):
                 is_long = False
             else:
-                # 无法判断方向，不处理
                 continue
 
-            # 持仓均价
             entry_price = (
                 pos.get("entryPrice")
                 or pos.get("avgPx")
@@ -163,33 +222,56 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
                 continue
             entry_price = float(entry_price)
 
-            # 当前价格
             ticker = fut_ex.fetch_ticker(symbol)
             last_price = float(ticker["last"])
 
             if entry_price <= 0:
                 continue
 
-            # 浮动收益率
+            # 杠杆（可能在不同字段里）
+            lev_raw = (
+                pos.get("leverage")
+                or pos.get("lever")
+                or pos.get("info", {}).get("lever")
+                or 3
+            )
+            try:
+                lev = float(lev_raw)
+            except Exception:
+                lev = 3.0
+
+            tp1, tp2, sl = _get_tp_sl_for_leverage(lev)
+
+            # 计算浮动收益率
             if is_long:
                 pnl_pct = (last_price - entry_price) / entry_price
             else:
                 pnl_pct = (entry_price - last_price) / entry_price
 
             reason = None
-            side = None  # 平仓方向
+            side = None
+            amount = 0.0
 
-            if pnl_pct >= FUTURES_TP_PCT:
-                reason = f"合约止盈: pnl={pnl_pct*100:.2f}%"
+            # 止损优先
+            if pnl_pct <= sl:
+                reason = f"合约止损: lev={lev:.1f}x, pnl={pnl_pct*100:.2f}%"
                 side = "sell" if is_long else "buy"
-            elif pnl_pct <= FUTURES_SL_PCT:
-                reason = f"合约止损: pnl={pnl_pct*100:.2f}%"
+                amount = abs(size)
+            # 第二档止盈（平全部）
+            elif pnl_pct >= tp2:
+                reason = f"合约止盈2: lev={lev:.1f}x, pnl={pnl_pct*100:.2f}%"
                 side = "sell" if is_long else "buy"
+                amount = abs(size)
+            # 第一档止盈（平 50%）
+            elif pnl_pct >= tp1:
+                reason = f"合约止盈1: lev={lev:.1f}x, pnl={pnl_pct*100:.2f}%"
+                side = "sell" if is_long else "buy"
+                amount = abs(size) * 0.5
+                if amount <= 0:
+                    amount = abs(size)
 
-            if reason is None or side is None:
+            if reason is None or side is None or amount <= 0:
                 continue
-
-            from bot.trader import Side as OrderSide, MarketType, OrderRequest  # 避免类型混淆
 
             order_side = OrderSide.SELL if side == "sell" else OrderSide.BUY
 
@@ -199,9 +281,9 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
                     market=MarketType.FUTURES,
                     symbol=symbol,
                     side=order_side,
-                    amount=abs(size),
+                    amount=amount,
                     price=None,
-                    leverage=None,   # 平仓不用管杠杆
+                    leverage=None,   # 平仓不需要设置杠杆
                     position_side=None,
                     reduce_only=True,
                     reason=reason,
@@ -239,7 +321,7 @@ def _apply_risk_controls(
         seen: Dict[tuple, bool] = {}
         deduped: List[OrderRequest] = []
         for o in orders:
-            key = (o.market, o.symbol, o.side.value, bool(o.reduce_only))
+            key = (o.market, o.symbol, o.side.value, bool(getattr(o, "reduce_only", False)))
             if key in seen:
                 continue
             seen[key] = True
@@ -250,7 +332,8 @@ def _apply_risk_controls(
     if len(orders) > MAX_ORDERS_PER_RUN:
         orders = orders[:MAX_ORDERS_PER_RUN]
 
-    # 名义金额限制
+    max_spot_notional, max_fut_notional = _get_notional_limits(env)
+
     adjusted: List[OrderRequest] = []
     for o in orders:
         if o.market == MarketType.SPOT:
@@ -258,8 +341,8 @@ def _apply_risk_controls(
                 ticker = spot_ex.fetch_ticker(o.symbol)
                 last_price = float(ticker["last"])
                 notional = o.amount * last_price
-                if notional > MAX_SPOT_NOTIONAL_USDT and last_price > 0:
-                    max_amt = MAX_SPOT_NOTIONAL_USDT / last_price
+                if notional > max_spot_notional and last_price > 0:
+                    max_amt = max_spot_notional / last_price
                     print(
                         f"[risk] 现货 {o.symbol} 名义金额 {notional:.2f} 超出限制，"
                         f"调整数量为 {max_amt:.6f}"
@@ -279,8 +362,8 @@ def _apply_risk_controls(
                 last_price = float(ticker["last"])
                 notional = o.amount * contract_size * last_price
 
-                if notional > MAX_FUTURES_NOTIONAL_USDT and last_price > 0:
-                    max_amt = MAX_FUTURES_NOTIONAL_USDT / (contract_size * last_price)
+                if notional > max_fut_notional and last_price > 0:
+                    max_amt = max_fut_notional / (contract_size * last_price)
                     max_amt = min(max_amt, MAX_FUTURES_CONTRACTS_PER_ORDER)
                     print(
                         f"[risk] 合约 {o.symbol} 名义金额 {notional:.2f} 超出限制，"
@@ -311,7 +394,7 @@ def _estimate_notional(
     fut_ex: ccxt.Exchange,
 ) -> float:
     """
-    估算下单金额（USDT）。只是用来展示，不要求和成交成本完全一致。
+    估算下单金额（USDT），用于展示。
     """
     try:
         if req.market == MarketType.SPOT:
@@ -390,22 +473,36 @@ def run_once() -> None:
 
     print(f"[main] 运行环境: {env.value}")
 
-    # 0. 先生成“合约止盈/止损平仓订单”
+    # 0. 查询余额
+    total_usdt, free_usdt = _fetch_usdt_balance(spot_ex)
+    print(f"[main] 账户 USDT 余额: total={total_usdt:.2f}, free={free_usdt:.2f}")
+
+    # 1. 先生成“合约止盈/止损/分批平仓订单”
     close_orders = _generate_futures_close_orders(env, fut_ex)
     if close_orders:
         print(f"[main] 检测到 {len(close_orders)} 个平仓订单。")
 
-    # 1. 策略生成新的开仓订单
-    open_orders: List[OrderRequest] = strategy.generate_orders(env)
+    # 2. 余额不足时，不再开新仓
+    can_open_new = free_usdt >= MIN_USDT_FREE_FOR_OPEN
+
+    # 3. 策略生成新的开仓订单
+    open_orders: List[OrderRequest] = []
+    if can_open_new:
+        open_orders = strategy.generate_orders(env)
+    else:
+        print(
+            f"[main] 可用余额 {free_usdt:.2f} USDT 低于阈值 {MIN_USDT_FREE_FOR_OPEN}, "
+            "本轮仅允许平仓，不开新仓。"
+        )
 
     if not close_orders and not open_orders:
         print("[main] 本次无交易信号，退出。")
         return
 
     all_orders = close_orders + open_orders
-    print(f"[main] 策略 + 仓位管理 共生成 {len(all_orders)} 个原始订单。")
+    print(f"[main] 仓位管理 + 策略 共生成 {len(all_orders)} 个原始订单。")
 
-    # 2. 应用基础风控
+    # 4. 应用基础风控
     orders = _apply_risk_controls(env, all_orders, spot_ex, fut_ex)
     print(f"[main] 风控后实际执行 {len(orders)} 个订单。")
 
@@ -413,7 +510,7 @@ def run_once() -> None:
         print("[main] 风控过滤掉所有订单，本次不交易。")
         return
 
-    # 3. 下单并记录结果
+    # 5. 下单并记录结果
     wecom_messages: List[str] = []
 
     for idx, req in enumerate(orders, start=1):
@@ -429,7 +526,7 @@ def run_once() -> None:
 
         print(msg)
 
-    # 4. 推送企业微信
+    # 6. 推送企业微信
     try:
         _send_batch_wecom_message(env, orders, wecom_messages)
         print("[main] 企业微信推送已发送。")
