@@ -1,294 +1,201 @@
 # bot/strategy.py
-"""
-混合策略系统（现货 + 合约 + 多周期）
-
-当前版本：
-- 只在 Env.TEST（OKX 模拟盘）下单
-- Env.LIVE（实盘）直接返回空列表（安全锁）
-- 启用现货 & 合约策略
-- 4h MA5/MA20 判趋势 + 强度
-- 1h 动量入场 + 最小波动过滤
-- 合约根据趋势强度 + 入场动量动态调整杠杆（1x ~ 20x）
-"""
-
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any, Tuple
-import ccxt
+import os
+from typing import List
 
 from bot.trader import (
+    Trader,
+    OrderRequest,
     Env,
     MarketType,
     Side,
-    OrderRequest,
+    PositionSide,
 )
 
-# =============================
-# 全局开关 & 参数
-# =============================
-
-ENABLE_SPOT = False
-ENABLE_FUTURES = True
-
-TREND_TF = "4h"
-ENTRY_TF = "1h"
-
-SPOT_SYMBOLS = ["BTC/USDT", "ETH/USDT"]
-FUTURES_SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
-
-
-# 趋势强度：MA5 与 MA20 至少相差 0.1%
-MIN_TREND_STRENGTH = 0.001  # 0.1%
-
-# 入场最小波动：1h 收盘至少波动 0.1%
-MIN_ENTRY_MOVE = 0.001      # 0.1%
-
-# 杠杆范围（主要用于 DEMO，LIVE 目前不下单）
-LEV_MIN = 1
-LEV_MAX = 20
-
 
 # =============================
-# ccxt 工具
+# 策略配置
 # =============================
 
-def get_exchange_spot() -> ccxt.Exchange:
-    ex = ccxt.okx()
-    ex.options["defaultType"] = "spot"
-    return ex
+# 需要交易的合约品种（OKX 永续）
+# 如果以后想增删，只改这里即可
+FUTURE_SYMBOLS = [
+    "ETH-USDT-SWAP",
+    "BTC-USDT-SWAP",
+    "ZEC-USDT-SWAP",
+    "ASTR-USDT-SWAP",  # 你说的 aster，这边按 OKX 上的 ASTR-USDT-SWAP 写
+]
+
+# 使用的 K 线周期，默认 4 小时
+TIMEFRAME = os.getenv("STRAT_TIMEFRAME", "4h")
+
+# 单笔目标名义金额（USDT），默认跟 main.py 里的 ORDER_USDT 一致
+TARGET_NOTIONAL_USDT = float(os.getenv("ORDER_USDT", "10"))
+
+# 默认合约杠杆
+DEFAULT_FUT_LEVERAGE = int(os.getenv("FUT_LEVERAGE", "5"))
+
+# EMA 周期
+EMA_FAST = 20
+EMA_SLOW = 50
+
+# 放量因子：最新一根 K 线成交量 > 最近 N 根平均 * VOL_FACTOR 才算“放量”
+VOL_LOOKBACK = 20
+VOL_FACTOR = 1.2
 
 
-def get_exchange_futures() -> ccxt.Exchange:
-    ex = ccxt.okx()
-    ex.options["defaultType"] = "swap"  # 永续
-    return ex
+# =============================
+# 工具函数
+# =============================
+
+def _ema(values: List[float], period: int) -> List[float]:
+    """简单 EMA 实现，返回同长度列表，前 period-1 个用第一个有效值填充。"""
+    if not values or period <= 1:
+        return values[:]
+
+    alpha = 2 / (period + 1)
+    ema_vals: List[float] = [values[0]]
+    for v in values[1:]:
+        ema_vals.append(alpha * v + (1 - alpha) * ema_vals[-1])
+
+    # 为了方便，只要长度一致即可
+    return ema_vals
 
 
-def fetch_ohlcv(
-    exchange: ccxt.Exchange,
+def _calc_trend_signals(closes: List[float], volumes: List[float]) -> str:
+    """
+    根据 EMA20 / EMA50 + 放量判断多空信号：
+
+    返回:
+        "long"  -> 做多信号
+        "short" -> 做空信号
+        "none"  -> 无信号
+    """
+    if len(closes) < max(EMA_FAST, EMA_SLOW) + 5:
+        return "none"
+
+    ema_fast = _ema(closes, EMA_FAST)
+    ema_slow = _ema(closes, EMA_SLOW)
+
+    last_close = closes[-1]
+    last_fast = ema_fast[-1]
+    last_slow = ema_slow[-1]
+
+    # 最近 N 根平均成交量，用于判断“放量”
+    if len(volumes) >= VOL_LOOKBACK + 1:
+        avg_vol = sum(volumes[-(VOL_LOOKBACK + 1):-1]) / VOL_LOOKBACK
+    else:
+        avg_vol = sum(volumes[:-1]) / max(len(volumes) - 1, 1)
+    last_vol = volumes[-1]
+
+    is_up_trend = last_fast > last_slow
+    is_down_trend = last_fast < last_slow
+    is_bull_break = last_close > last_fast
+    is_bear_break = last_close < last_fast
+    is_volume_spike = last_vol > avg_vol * VOL_FACTOR
+
+    # 简单规则：
+    # 1）当前 fast > slow 且收盘在 fast 之上 + 放量 -> 做多信号
+    if is_up_trend and is_bull_break and is_volume_spike:
+        return "long"
+
+    # 2）fast < slow 且收盘在 fast 之下 + 放量 -> 做空信号
+    if is_down_trend and is_bear_break and is_volume_spike:
+        return "short"
+
+    return "none"
+
+
+def _build_futures_order(
+    trader: Trader,
     symbol: str,
-    timeframe: str,
-    limit: int = 100,
-    params: Optional[Dict[str, Any]] = None,
-):
-    return exchange.fetch_ohlcv(
-        symbol,
-        timeframe=timeframe,
-        limit=limit,
-        params=params or {},
+    signal: str,
+    last_price: float,
+) -> OrderRequest:
+    """
+    由信号构造一个 OrderRequest（只开仓，不平仓，reduce_only=False）。
+    """
+    # 目标名义金额 -> 数量
+    notional = TARGET_NOTIONAL_USDT
+    if last_price <= 0:
+        # 极端情况，防止除零，给一个非常小的默认数量
+        amount = 0.001
+    else:
+        amount = notional / last_price
+
+    if signal == "long":
+        side = Side.BUY
+        pos_side = PositionSide.LONG
+        reason = f"{TIMEFRAME} EMA 多头趋势 + 放量突破"
+    else:  # "short"
+        side = Side.SELL
+        pos_side = PositionSide.SHORT
+        reason = f"{TIMEFRAME} EMA 空头趋势 + 放量跌破"
+
+    return OrderRequest(
+        env=trader.env,
+        market=MarketType.FUTURES,
+        symbol=symbol,
+        side=side,
+        amount=amount,
+        leverage=DEFAULT_FUT_LEVERAGE,
+        position_side=pos_side,
+        reduce_only=False,
+        reason=reason,
     )
 
 
 # =============================
-# 对外主入口
+# 主策略入口
 # =============================
 
-def generate_orders(env: Env) -> List[OrderRequest]:
+def generate_orders(trader: Trader) -> List[OrderRequest]:
     """
-    main.py 只调用这个函数获取订单列表。
-    """
-    # 实盘继续锁死，确保现在所有改动只在 DEMO 生效
-    if env == Env.LIVE:
-        print("[strategy] LIVE 环境暂未启用策略，返回空列表。")
-        return []
+    策略主入口（main.py 会直接调用这个函数）。
 
+    当前逻辑：
+    - 只做 OKX 合约（SWAP）
+    - 4 小时 K 线
+    - 对每个设定好的品种：
+        * 计算 EMA20 / EMA50
+        * 判断是否处于趋势行情（多 / 空）
+        * 判断是否有“放量突破 / 跌破”
+        * 有信号 -> 生成一个对应方向的开仓订单
+    - 返回的订单会交给 main.py 做统一风控、下单、记录、推送。
+    """
     orders: List[OrderRequest] = []
 
-    if ENABLE_SPOT:
-        orders.extend(run_spot_strategy(env))
+    fut = trader.futures
 
-    if ENABLE_FUTURES:
-        orders.extend(run_futures_strategy(env))
+    for symbol in FUTURE_SYMBOLS:
+        try:
+            # 获取 K 线数据： [timestamp, open, high, low, close, volume]
+            ohlcv = fut.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=120)
+            if not ohlcv or len(ohlcv) < 60:
+                print(f"[strategy] {symbol} K线数据不足，跳过。")
+                continue
+
+            closes = [c[4] for c in ohlcv]
+            vols = [c[5] for c in ohlcv]
+            last_price = closes[-1]
+
+            signal = _calc_trend_signals(closes, vols)
+
+            if signal == "none":
+                print(f"[strategy] {symbol} 当前无信号。")
+                continue
+
+            order = _build_futures_order(trader, symbol, signal, last_price)
+            orders.append(order)
+
+            print(
+                f"[strategy] 生成 {symbol} 信号: {signal}, "
+                f"last_price={last_price:.4f}, amount~{order.amount:.6f}"
+            )
+
+        except Exception as e:
+            print(f"[strategy] 处理 {symbol} 时出错: {e}")
+            continue
 
     return orders
-
-
-# =============================
-# 现货策略
-# =============================
-
-def run_spot_strategy(env: Env) -> List[OrderRequest]:
-    ex = get_exchange_spot()
-    results: List[OrderRequest] = []
-
-    for symbol in SPOT_SYMBOLS:
-        try:
-            trend = fetch_ohlcv(ex, symbol, TREND_TF, limit=50, params={"instType": "SPOT"})
-            entry = fetch_ohlcv(ex, symbol, ENTRY_TF, limit=50, params={"instType": "SPOT"})
-
-            direction, trend_strength = detect_trend_direction(trend)
-            side, move_ratio = detect_entry_signal(entry, direction)
-
-            if side is None or direction == "flat":
-                continue
-
-            reason = (
-                f"现货混合策略: trend={direction}, "
-                f"trend_strength={trend_strength*100:.2f}%, "
-                f"move={move_ratio*100:.2f}%, signal={side.value}"
-            )
-
-            order = OrderRequest(
-                env=env,
-                market=MarketType.SPOT,
-                symbol=symbol,
-                side=side,
-                amount=0.001,  # 名义金额由 main.py 控制
-                price=None,
-                leverage=None,
-                position_side=None,
-                reason=reason,
-            )
-            results.append(order)
-
-        except Exception as e:
-            print(f"[SPOT] {symbol} 策略错误: {e}")
-
-    return results
-
-
-# =============================
-# 合约策略
-# =============================
-
-def run_futures_strategy(env: Env) -> List[OrderRequest]:
-    ex = get_exchange_futures()
-    results: List[OrderRequest] = []
-
-    for symbol in FUTURES_SYMBOLS:
-        try:
-            trend = fetch_ohlcv(ex, symbol, TREND_TF, limit=50, params={"instType": "SWAP"})
-            entry = fetch_ohlcv(ex, symbol, ENTRY_TF, limit=50, params={"instType": "SWAP"})
-
-            direction, trend_strength = detect_trend_direction(trend)
-            side, move_ratio = detect_entry_signal(entry, direction)
-
-            if side is None or direction == "flat":
-                continue
-
-            conf_level, lev = decide_leverage(trend_strength, move_ratio)
-
-            reason = (
-                f"合约混合策略: trend={direction}, "
-                f"trend_strength={trend_strength*100:.2f}%, "
-                f"move={move_ratio*100:.2f}%, "
-                f"conf={conf_level}, lev={lev}x, signal={side.value}"
-            )
-
-            order = OrderRequest(
-                env=env,
-                market=MarketType.FUTURES,
-                symbol=symbol,
-                side=side,
-                amount=1,           # 张数占位，名义金额由 main.py 压到 ~10–20U
-                price=None,
-                leverage=lev,
-                position_side=None, # 单向持仓模式
-                reason=reason,
-            )
-            results.append(order)
-
-        except Exception as e:
-            print(f"[FUTURES] {symbol} 策略错误: {e}")
-
-    return results
-
-
-# =============================
-# 趋势判断：MA5 / MA20 + 强度
-# =============================
-
-def detect_trend_direction(trend_kline: List[List[Any]]) -> Tuple[str, float]:
-    """
-    返回 (direction, strength)，direction in {"up","down","flat"}，
-    strength 是 MA5/MA20 差值百分比。
-    """
-    closes = [c[4] for c in trend_kline]
-    if len(closes) < 20:
-        return "flat", 0.0
-
-    ma_fast = sum(closes[-5:]) / 5
-    ma_slow = sum(closes[-20:]) / 20
-
-    if ma_slow == 0:
-        return "flat", 0.0
-
-    diff_ratio = abs(ma_fast - ma_slow) / ma_slow
-
-    if diff_ratio < MIN_TREND_STRENGTH:
-        return "flat", diff_ratio
-
-    if ma_fast > ma_slow:
-        return "up", diff_ratio
-    elif ma_fast < ma_slow:
-        return "down", diff_ratio
-    else:
-        return "flat", diff_ratio
-
-
-# =============================
-# 入场信号：1h 动量 + 最小波动
-# =============================
-
-def detect_entry_signal(entry_kline: List[List[Any]], trend: str) -> Tuple[Optional[Side], float]:
-    """
-    返回 (side, move_ratio)，side 可能为 None。
-    """
-    if trend not in ("up", "down"):
-        return None, 0.0
-
-    closes = [c[4] for c in entry_kline]
-    if len(closes) < 3:
-        return None, 0.0
-
-    last = closes[-1]
-    prev = closes[-2]
-
-    if prev == 0:
-        return None, 0.0
-
-    move_ratio = abs(last - prev) / prev
-    if move_ratio < MIN_ENTRY_MOVE:
-        # 波动太小，不交易
-        return None, move_ratio
-
-    if trend == "up" and last > prev:
-        return Side.BUY, move_ratio
-    if trend == "down" and last < prev:
-        return Side.SELL, move_ratio
-
-    return None, move_ratio
-
-
-# =============================
-# 根据信号强弱决定杠杆（1x ~ 20x）
-# =============================
-
-def decide_leverage(trend_strength: float, move_ratio: float) -> Tuple[str, int]:
-    """
-    根据趋势强度和入场动量决定杠杆：
-        - weak   -> 2x
-        - normal -> 4x
-        - strong -> 8x
-        - ultra  -> 15x
-    """
-    ts = trend_strength / (MIN_TREND_STRENGTH + 1e-9)
-    mv = move_ratio / (MIN_ENTRY_MOVE + 1e-9)
-
-    score = (ts + mv) / 2  # 简单平均
-
-    if score < 2:
-        level = "weak"
-        lev = 2
-    elif score < 4:
-        level = "normal"
-        lev = 4
-    elif score < 8:
-        level = "strong"
-        lev = 8
-    else:
-        level = "ultra"
-        lev = 15
-
-    lev = max(LEV_MIN, min(lev, LEV_MAX))
-    return level, lev
