@@ -12,32 +12,39 @@ from bot.trader import (
 )
 
 
-def main():
-    print("=== 0. 自检开始（Binance Demo 现货 + 合约） ===")
+def main() -> None:
+    print("=== 0. 自检开始（OKX 模拟盘：现货 + 合约） ===")
 
-    demo_keys = {
-        "apiKey": os.getenv("BINANCE_DEMO_API_KEY"),
-        "secret": os.getenv("BINANCE_DEMO_API_SECRET"),
+    paper_keys = {
+        "apiKey": os.getenv("OKX_PAPER_API_KEY"),
+        "secret": os.getenv("OKX_PAPER_API_SECRET"),
+        "password": os.getenv("OKX_PAPER_API_PASSPHRASE"),
     }
 
-    print("Demo Key 是否存在:", bool(demo_keys["apiKey"]))
+    live_keys = {
+        "apiKey": os.getenv("OKX_LIVE_API_KEY"),
+        "secret": os.getenv("OKX_LIVE_API_SECRET"),
+        "password": os.getenv("OKX_LIVE_API_PASSPHRASE"),
+    }
+
+    print("Paper Key 是否存在:", bool(paper_keys["apiKey"]))
+    print("Live Key 是否存在:", bool(live_keys["apiKey"]))
 
     trader = Trader(
-        exchange_id="binance",
-        demo_keys=demo_keys,
-        live_spot_keys={},
-        live_futures_keys={},
+        exchange_id="okx",
+        paper_keys=paper_keys,
+        live_keys=live_keys,
     )
 
-    # --- DEMO 现货：市价买 BTC/USDT ---
+    # === 1. 模拟盘现货市价买单 ===
     print("=== 1. DEMO 现货市价买单 ===")
     spot_req = OrderRequest(
         env=Env.TEST,
         market=MarketType.SPOT,
-        symbol="BTC/USDT",
+        symbol="BTC/USDT",   # OKX 现货交易对
         side=Side.BUY,
-        amount=0.0001,        # 看你 demo 里余额，太大就减小
-        price=None,
+        amount=0.001,        # 根据模拟盘余额自行调整
+        price=None,          # 市价
         leverage=None,
         position_side=None,
         reason="DEMO 现货下单验证",
@@ -46,15 +53,15 @@ def main():
     print("=== 现货结果 ===")
     print(Trader.format_wecom_message(spot_req, spot_res))
 
-    # --- DEMO 合约：5x 杠杆 开多 BTCUSDT 永续 ---
+    # === 2. 模拟盘合约开多单（USDT 永续） ===
     print("=== 2. DEMO 合约开多单 ===")
     futures_req = OrderRequest(
         env=Env.TEST,
         market=MarketType.FUTURES,
-        symbol="BTC/USDT",     # defaultType=future 时，依然用 BTC/USDT
+        symbol="BTC/USDT:USDT",     # OKX U 本位永续
         side=Side.BUY,
-        amount=0.001,          # 余额不多可以再调小
-        price=None,
+        amount=1,                   # 合约张数，余额不多可减小
+        price=None,                 # 市价
         leverage=5,
         position_side=PositionSide.LONG,
         reason="DEMO 合约开多验证",
