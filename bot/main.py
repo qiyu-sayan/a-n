@@ -1,4 +1,3 @@
-# bot/main.py
 """
 交易机器人主入口 (OKX + WeCom)
 
@@ -85,10 +84,6 @@ TRADE_LOG_PATH = "logs/trades.csv"
 def _load_okx_env(env: Env) -> Tuple[str, str, str]:
     """
     返回 (api_key, api_secret, passphrase)
-
-    注意这里直接用你 run-bot.yml 里已经有的两个 Secret：
-    - OKX_PAPER_API_PASSPHRASE
-    - OKX_LIVE_API_PASSPHRASE
     """
     if env == Env.TEST:
         key = os.environ["OKX_PAPER_API_KEY"]
@@ -117,7 +112,7 @@ def _create_exchanges(env: Env) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
         "password": passphrase,
     })
 
-    # 有些 ccxt 版本里 OKX 的 id 不是统一的，这里强制写成 okx，避免后面检查出错
+    # 某些 ccxt 版本 OKX id 不统一，这里强制为 okx
     try:
         spot.id = "okx"
     except Exception:
@@ -556,7 +551,6 @@ def run_once(env: Env) -> None:
     spot_ex, fut_ex = _create_exchanges(env)
     _load_markets(spot_ex, fut_ex)
 
-    # 这里用“位置参数”创建 Trader，避免 env 关键字报错
     trader = Trader(env, spot_ex, fut_ex)
 
     if env == Env.LIVE:
@@ -566,8 +560,8 @@ def run_once(env: Env) -> None:
     else:
         print("Notice：当前为 DEMO 模拟盘环境，用于调试策略与风控逻辑，请勿视为实盘。")
 
-    # 生成本轮的开仓信号
-    open_orders = generate_orders(env, trader)
+    # 生成本轮的开仓信号（‼️ 只传 trader）
+    open_orders = generate_orders(trader)
 
     # 生成自动止盈/止损平仓订单（仅 LIVE）
     close_orders = _generate_futures_close_orders(env, fut_ex)
