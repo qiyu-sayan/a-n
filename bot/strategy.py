@@ -1,19 +1,24 @@
 # bot/strategy.py
 """
 混合策略系统（现货 + 合约 + 多周期）
------------------------------------
 
-这是一个专业级策略框架模板，用来构建你的自动交易系统。
+当前版本说明：
+----------------
+- 只在 Env.TEST（OKX 模拟盘）下单
+- Env.LIVE（实盘）直接返回空列表，不会下任何单
+- 同时开启现货 & 合约策略
+- 使用 4h K 线判断大趋势（MA5 / MA20）
+- 使用 1h K 线做简单动量入场：
+    - 趋势向上且最新 1h 收盘 > 前一根收盘 → BUY
+    - 趋势向下且最新 1h 收盘 < 前一根收盘 → SELL
+- 每次运行可能同时给出：
+    - 现货 BTC/USDT 1 笔
+    - 合约 BTC/USDT:USDT 1 笔（3x 杠杆，单向模式）
 
-特性：
-- 同时支持：现货 + 合约
-- 多周期分析：trend_tf 决定方向、entry_tf 决定入场
-- 策略可组合（每个策略模块独立）
-- 默认不下单（安全模式）
-- 可以把任何策略逻辑（MA/RSI/结构/突破）插入到模板中
-
-你未来的所有策略只需要在本文件内扩展。
-主流程 main.py 与交易逻辑完全解耦。
+注意：
+- run-bot 目前每 30min 跑一次，而入场周期是 1h，
+  所以同一根 1h K 线内可能触发多次同方向信号（会重复加仓）。
+  这在模拟盘可以接受，后面我们可以再加“去重/控频”。
 """
 
 from __future__ import annotations
@@ -30,44 +35,67 @@ from bot.trader import (
 )
 
 # =============================
-# 参数区（策略全局控制中心）
+# 全局开关 & 参数
 # =============================
 
-# 策略开关
-ENABLE_SPOT = False
-ENABLE_FUTURES = False
+# 现货 / 合约都开
+ENABLE_SPOT = True
+ENABLE_FUTURES = True
 
-# 多周期
-TREND_TF = "4h"   # 趋势方向周期
+# 多周期参数
+TREND_TF = "4h"   # 趋势周期
 ENTRY_TF = "1h"   # 入场周期
 
-# 要交易的币（可扩展多个）
+# 交易品种（先只跑 BTC，后面你可以自己加 ETH 等）
 SPOT_SYMBOLS = ["BTC/USDT"]
 FUTURES_SYMBOLS = ["BTC/USDT:USDT"]
 
 
 # =============================
-# 工具函数：获取 K 线
+# ccxt 工具
 # =============================
 
-def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 100):
-    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-
-
-def get_exchange():
+def get_exchange_spot() -> ccxt.Exchange:
     ex = ccxt.okx()
-    ex.options["defaultType"] = "swap"  # 合约默认
+    ex.options["defaultType"] = "spot"
     return ex
 
 
+def get_exchange_futures() -> ccxt.Exchange:
+    ex = ccxt.okx()
+    ex.options["defaultType"] = "swap"  # OKX 永续
+    return ex
+
+
+def fetch_ohlcv(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    timeframe: str,
+    limit: int = 100,
+    params: Optional[Dict[str, Any]] = None,
+):
+    return exchange.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        limit=limit,
+        params=params or {},
+    )
+
+
 # =============================
-# 主入口：外部调用 generate_orders(env)
+# 对外主入口
 # =============================
 
 def generate_orders(env: Env) -> List[OrderRequest]:
     """
-    返回本次全部订单（现货 + 合约），为空则 main.py 不会下单。
+    main.py 每次只调用这个函数获取订单列表。
     """
+
+    # 关键保护：实盘目前禁用所有策略
+    if env == Env.LIVE:
+        print("[strategy] LIVE 环境暂未启用策略，返回空列表。")
+        return []
+
     orders: List[OrderRequest] = []
 
     if ENABLE_SPOT:
@@ -80,96 +108,96 @@ def generate_orders(env: Env) -> List[OrderRequest]:
 
 
 # =============================
-# 现货混合策略（模板）
+# 现货策略
 # =============================
 
 def run_spot_strategy(env: Env) -> List[OrderRequest]:
-    exchange = get_exchange()
+    ex = get_exchange_spot()
     results: List[OrderRequest] = []
 
     for symbol in SPOT_SYMBOLS:
         try:
-            trend = fetch_ohlcv(exchange, symbol, TREND_TF)
-            entry = fetch_ohlcv(exchange, symbol, ENTRY_TF)
+            trend = fetch_ohlcv(ex, symbol, TREND_TF, limit=50, params={"instType": "SPOT"})
+            entry = fetch_ohlcv(ex, symbol, ENTRY_TF, limit=50, params={"instType": "SPOT"})
 
             direction = detect_trend_direction(trend)
-            entry_signal = detect_entry_signal(entry, direction)
+            side = detect_entry_signal(entry, direction)
 
-            if entry_signal is None:
+            if side is None or direction == "flat":
                 continue
 
             order = OrderRequest(
                 env=env,
                 market=MarketType.SPOT,
                 symbol=symbol,
-                side=entry_signal,
-                amount=0.001,
-                price=None,
+                side=side,
+                amount=0.001,       # 非常小的 0.001 BTC，模拟盘够用
+                price=None,         # 市价单
                 leverage=None,
                 position_side=None,
-                reason=f"现货混合策略：趋势={direction}, 入场信号={entry_signal.value}",
+                reason=f"现货混合策略: trend={direction}, signal={side.value}",
             )
             results.append(order)
 
         except Exception as e:
-            print(f"[SPOT] {symbol} 策略错误：{e}")
+            print(f"[SPOT] {symbol} 策略错误: {e}")
 
     return results
 
 
 # =============================
-# 合约混合策略（模板）
+# 合约策略
 # =============================
 
 def run_futures_strategy(env: Env) -> List[OrderRequest]:
-    exchange = get_exchange()
+    ex = get_exchange_futures()
     results: List[OrderRequest] = []
 
     for symbol in FUTURES_SYMBOLS:
         try:
-            trend = fetch_ohlcv(exchange, symbol, TREND_TF)
-            entry = fetch_ohlcv(exchange, symbol, ENTRY_TF)
+            trend = fetch_ohlcv(ex, symbol, TREND_TF, limit=50, params={"instType": "SWAP"})
+            entry = fetch_ohlcv(ex, symbol, ENTRY_TF, limit=50, params={"instType": "SWAP"})
 
             direction = detect_trend_direction(trend)
-            entry_signal = detect_entry_signal(entry, direction)
+            side = detect_entry_signal(entry, direction)
 
-            if entry_signal is None:
+            if side is None or direction == "flat":
                 continue
 
             order = OrderRequest(
                 env=env,
                 market=MarketType.FUTURES,
                 symbol=symbol,
-                side=entry_signal,
-                amount=1,
-                price=None,
+                side=side,
+                amount=1,           # 1 张，配合 3x 杠杆，风险很小（模拟盘用）
+                price=None,         # 市价单
                 leverage=3,
-                position_side=None,  # 单向模式
-                reason=f"合约混合策略：趋势={direction}, 入场信号={entry_signal.value}",
+                position_side=None, # 单向持仓模式
+                reason=f"合约混合策略: trend={direction}, signal={side.value}",
             )
             results.append(order)
 
         except Exception as e:
-            print(f"[FUTURES] {symbol} 策略错误：{e}")
+            print(f"[FUTURES] {symbol} 策略错误: {e}")
 
     return results
 
 
 # =============================
-# 趋势方向检测（模板，可扩展）
+# 趋势判断：MA5 / MA20
 # =============================
 
 def detect_trend_direction(trend_kline: List[List[Any]]) -> str:
     """
-    返回：
-        "up"   → 看多趋势
-        "down" → 看空趋势
-        "flat" → 震荡，不做单
-    默认使用 MA 指标做示例逻辑，但不会触发下单（因为 entry_signal 默认返回 None）
+    简单趋势判断：
+        MA5 > MA20 → up（看多）
+        MA5 < MA20 → down（看空）
+        否则 → flat（不交易）
     """
     closes = [c[4] for c in trend_kline]
+    if len(closes) < 20:
+        return "flat"
 
-    # 示例 MA
     ma_fast = sum(closes[-5:]) / 5
     ma_slow = sum(closes[-20:]) / 20
 
@@ -177,23 +205,35 @@ def detect_trend_direction(trend_kline: List[List[Any]]) -> str:
         return "up"
     elif ma_fast < ma_slow:
         return "down"
-    return "flat"
+    else:
+        return "flat"
 
 
 # =============================
-# 入场信号检测（模板，可扩展）
+# 入场信号：1h 简单动量
 # =============================
 
 def detect_entry_signal(entry_kline: List[List[Any]], trend: str) -> Optional[Side]:
     """
-    返回：
-        Side.BUY    → 开多
-        Side.SELL   → 开空
-        None        → 不下单
+    入场条件（非常简化版，只是为了让 DEMO 跑起来）：
 
-    模板逻辑：永远返回 None（安全）
-    你未来可以自己加信号，例如：
-        • 趋势为 up 且收出强势多头信号 → BUY
-        • 趋势为 down 且收盘跌破区间 → SELL
+        - trend = "up"，且最新一根 1h 收盘 > 前一根收盘 → BUY
+        - trend = "down"，且最新一根 1h 收盘 < 前一根收盘 → SELL
+        - 其余情况 → 不交易（返回 None）
     """
+    if trend not in ("up", "down"):
+        return None
+
+    closes = [c[4] for c in entry_kline]
+    if len(closes) < 3:
+        return None
+
+    last = closes[-1]
+    prev = closes[-2]
+
+    if trend == "up" and last > prev:
+        return Side.BUY
+    if trend == "down" and last < prev:
+        return Side.SELL
+
     return None
