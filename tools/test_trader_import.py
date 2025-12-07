@@ -10,10 +10,11 @@ from bot.trader import (
     PositionSide,
     OrderRequest,
 )
+from bot.wecom_notify import send_wecom_message
 
 
 def main() -> None:
-    print("=== 0. 自检开始（OKX 模拟盘：现货 + 合约） ===")
+    print("=== 0. 自检开始（OKX 模拟盘：现货 + 合约 + WeCom） ===")
 
     paper_keys = {
         "apiKey": os.getenv("OKX_PAPER_API_KEY"),
@@ -50,8 +51,9 @@ def main() -> None:
         reason="DEMO 现货下单验证",
     )
     spot_res = trader.place_order(spot_req)
+    spot_msg = Trader.format_wecom_message(spot_req, spot_res)
     print("=== 现货结果 ===")
-    print(Trader.format_wecom_message(spot_req, spot_res))
+    print(spot_msg)
 
     # === 2. 模拟盘合约开多单（USDT 永续） ===
     print("=== 2. DEMO 合约开多单 ===")
@@ -63,13 +65,31 @@ def main() -> None:
         amount=1,                   # 合约张数，余额不多可减小
         price=None,                 # 市价
         leverage=5,
-        position_side=None,         # 单向持仓模式，不再传 posSide
+        position_side=None,         # 单向持仓，不传 posSide
         reason="DEMO 合约开多验证",
     )
-
     futures_res = trader.place_order(futures_req)
+    futures_msg = Trader.format_wecom_message(futures_req, futures_res)
     print("=== 合约结果 ===")
-    print(Trader.format_wecom_message(futures_req, futures_res))
+    print(futures_msg)
+
+    # === 3. 发送企业微信通知 ===
+    combined = (
+        "### OKX 模拟盘下单测试\n"
+        "\n"
+        "**现货结果：**\n"
+        f"{spot_msg}\n"
+        "\n"
+        "**合约结果：**\n"
+        f"{futures_msg}\n"
+    )
+
+    print("=== 发送企业微信通知 ===")
+    try:
+        send_wecom_message(combined)
+        print("企业微信通知已发送")
+    except Exception as e:
+        print(f"发送企业微信失败: {e}")
 
     print("=== 自检结束 ===")
 
