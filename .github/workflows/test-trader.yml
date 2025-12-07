@@ -8,8 +8,13 @@ jobs:
     runs-on: self-hosted
 
     env:
-      BINANCE_DEMO_API_KEY: ${{ secrets.BINANCE_DEMO_API_KEY }}
-      BINANCE_DEMO_API_SECRET: ${{ secrets.BINANCE_DEMO_API_SECRET }}
+      OKX_PAPER_API_KEY: ${{ secrets.OKX_PAPER_API_KEY }}
+      OKX_PAPER_API_SECRET: ${{ secrets.OKX_PAPER_API_SECRET }}
+      OKX_PAPER_API_PASSPHRASE: ${{ secrets.OKX_PAPER_API_PASSPHRASE }}
+
+      OKX_LIVE_API_KEY: ${{ secrets.OKX_LIVE_API_KEY }}
+      OKX_LIVE_API_SECRET: ${{ secrets.OKX_LIVE_API_SECRET }}
+      OKX_LIVE_API_PASSPHRASE: ${{ secrets.OKX_LIVE_API_PASSPHRASE }}
 
     steps:
       - name: Checkout repo
@@ -25,6 +30,6 @@ jobs:
           pip install ccxt
           pip install -r requirements.txt || true
 
-      - name: Run test trader (demo spot + futures)
+      - name: Run OKX test trader (demo spot + futures)
         run: |
           python -m tools.test_trader_import
