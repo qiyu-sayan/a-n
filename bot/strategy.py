@@ -13,7 +13,6 @@ from bot.trader import (
     PositionSide,
 )
 
-
 # =============================
 # 策略配置
 # =============================
@@ -48,7 +47,7 @@ VOL_FACTOR = 1.2
 # =============================
 
 def _ema(values: List[float], period: int) -> List[float]:
-    """简单 EMA 实现，返回同长度列表，前 period-1 个用第一个有效值填充。"""
+    """简单 EMA 实现，返回同长度列表。"""
     if not values or period <= 1:
         return values[:]
 
@@ -64,41 +63,64 @@ def _calc_trend_signals(closes: List[float], volumes: List[float]) -> str:
     """
     根据 EMA20 / EMA50 + 放量判断多空信号：
 
+    使用「上一根已经收盘的 K 线」做信号，避免未收线乱抖。
+
     返回:
         "long"  -> 做多信号
         "short" -> 做空信号
         "none"  -> 无信号
     """
-    if len(closes) < max(EMA_FAST, EMA_SLOW) + 5:
+    min_len = max(EMA_FAST, EMA_SLOW) + 3  # 至少多几根方便取前一根
+    if len(closes) < min_len:
         return "none"
 
     ema_fast = _ema(closes, EMA_FAST)
     ema_slow = _ema(closes, EMA_SLOW)
 
-    last_close = closes[-1]
-    last_fast = ema_fast[-1]
-    last_slow = ema_slow[-1]
+    # 使用上一根收盘 K 线作为信号基础
+    idx = -2         # 上一根已收线
+    prev_idx = -3    # 上上一根
 
-    # 最近 N 根平均成交量，用于判断“放量”
-    if len(volumes) >= VOL_LOOKBACK + 1:
-        avg_vol = sum(volumes[-(VOL_LOOKBACK + 1):-1]) / VOL_LOOKBACK
+    last_close = closes[idx]
+    last_fast = ema_fast[idx]
+    last_slow = ema_slow[idx]
+
+    prev_fast = ema_fast[prev_idx]
+    prev_slow = ema_slow[prev_idx]
+
+    # 成交量：上一根 vs 前若干根平均
+    if len(volumes) + prev_idx <= 0:
+        return "none"
+
+    last_vol = volumes[idx]
+    start = max(0, idx - VOL_LOOKBACK)  # [start, idx) 不含 idx
+    if idx - start <= 0:
+        avg_vol = sum(volumes[:idx]) / max(idx, 1)
     else:
-        avg_vol = sum(volumes[:-1]) / max(len(volumes) - 1, 1)
-    last_vol = volumes[-1]
+        avg_vol = sum(volumes[start:idx]) / (idx - start)
 
-    is_up_trend = last_fast > last_slow
-    is_down_trend = last_fast < last_slow
-    is_bull_break = last_close > last_fast
-    is_bear_break = last_close < last_fast
     is_volume_spike = last_vol > avg_vol * VOL_FACTOR
 
+    # 快慢 EMA 当前趋势
+    is_up_trend = last_fast > last_slow
+    is_down_trend = last_fast < last_slow
+
+    # 关注“交叉”：
+    # 多头：上一根 fast 从下向上穿 slow，且收盘在 fast 之上
+    crossed_up = (prev_fast <= prev_slow) and (last_fast > last_slow)
+    # 空头：上一根 fast 从上向下穿 slow，且收盘在 fast 之下
+    crossed_down = (prev_fast >= prev_slow) and (last_fast < last_slow)
+
+    is_bull_break = last_close > last_fast
+    is_bear_break = last_close < last_fast
+
     # 简单规则：
-    # 1）当前 fast > slow 且收盘在 fast 之上 + 放量 -> 做多信号
-    if is_up_trend and is_bull_break and is_volume_spike:
+    # 1）快线向上金叉 + 多头趋势 + 收盘在快线之上 + 放量 -> 做多信号
+    if crossed_up and is_up_trend and is_bull_break and is_volume_spike:
         return "long"
 
-    # 2）fast < slow 且收盘在 fast 之下 + 放量 -> 做空信号
-    if is_down_trend and is_bear_break and is_volume_spike:
+    # 2）快线向下死叉 + 空头趋势 + 收盘在快线之下 + 放量 -> 做空信号
+    if crossed_down and is_down_trend and is_bear_break and is_volume_spike:
         return "short"
 
     return "none"
@@ -124,11 +146,11 @@ def _build_futures_order(
     if signal == "long":
         side = Side.BUY
         pos_side = PositionSide.LONG
-        reason = f"{TIMEFRAME} EMA 多头趋势 + 放量突破"
+        reason = f"{TIMEFRAME} EMA 金叉多头 + 放量"
     else:  # "short"
         side = Side.SELL
         pos_side = PositionSide.SHORT
-        reason = f"{TIMEFRAME} EMA 空头趋势 + 放量跌破"
+        reason = f"{TIMEFRAME} EMA 死叉空头 + 放量"
 
     return OrderRequest(
         env=trader.env,
@@ -156,8 +178,7 @@ def generate_orders(trader: Trader) -> List[OrderRequest]:
     - 使用 4 小时 K 线做趋势+放量判断
     - 对 ETH / BTC 两个品种分别：
         * 计算 EMA20 / EMA50
-        * 判断是否处于趋势行情（多 / 空）
-        * 判断是否有“放量突破 / 跌破”
+        * 用“上一根收盘 K 线”的 EMA 金叉/死叉 + 放量判定多空信号
         * 有信号 -> 生成一个对应方向的开仓订单
     - 返回的订单会交给 main.py 做统一风控、下单、记录、推送。
     """
@@ -175,13 +196,15 @@ def generate_orders(trader: Trader) -> List[OrderRequest]:
 
             closes = [c[4] for c in ohlcv]
             vols = [c[5] for c in ohlcv]
-            last_price = closes[-1]
 
             signal = _calc_trend_signals(closes, vols)
 
             if signal == "none":
                 print(f"[strategy] {symbol} 当前无信号。")
                 continue
+
+            # last_price 用上一根收盘价
+            last_price = closes[-2]
 
             order = _build_futures_order(trader, symbol, signal, last_price)
             orders.append(order)
