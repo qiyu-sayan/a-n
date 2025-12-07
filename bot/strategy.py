@@ -1,64 +1,178 @@
 # bot/strategy.py
-# -*- coding: utf-8 -*-
-import json, os, math
-from statistics import mean
+"""
+策略模块（你可以在这里组合多种策略）
 
-def load_params(path="config/params.json"):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+目标：
+- 同时支持现货 & 合约（你在问题 1 里选了 C）
+- 预留 K 线策略 / 你自己的旧策略 / 手工测试单的组合空间
+- 默认行为：不下单（保证安全）
 
-def sma(series, n):
-    if len(series) < n: return None
-    return sum(series[-n:]) / n
+核心对外接口：
+    generate_orders(env: Env) -> list[OrderRequest]
 
-def rsi(closes, n=14):
-    if len(closes) <= n: return None
-    gains, losses = [], []
-    for i in range(1, n+1):
-        chg = closes[-i] - closes[-i-1]
-        if chg >= 0: gains.append(chg)
-        else: losses.append(-chg)
-    avg_gain = sum(gains)/n if gains else 0.0
-    avg_loss = sum(losses)/n if losses else 0.0
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100/(1+rs))
+后续你想改策略，只需要改这个文件，不需要动 main.py / trader.py。
+"""
 
-def signal_sma_rsi(closes, p):
-    fast = p["sma_fast"]; slow = p["sma_slow"]
-    rlen = p["rsi_len"];  rb = p["rsi_buy_below"]; rs = p["rsi_sell_above"]
+from __future__ import annotations
 
-    if len(closes) < max(slow, rlen) + 2: return "HOLD"
+from typing import List
 
-    sma_fast_prev = sma(closes[:-1], fast); sma_slow_prev = sma(closes[:-1], slow)
-    sma_fast_now  = sma(closes, fast);      sma_slow_now  = sma(closes, slow)
-    r = rsi(closes, rlen)
+from bot.trader import (
+    Env,
+    MarketType,
+    Side,
+    PositionSide,
+    OrderRequest,
+)
 
-    cross_up   = sma_fast_prev <= sma_slow_prev and sma_fast_now > sma_slow_now
-    cross_down = sma_fast_prev >= sma_slow_prev and sma_fast_now < sma_slow_now
+# ===================== 策略开关（很重要） =====================
 
-    if cross_up and (r is None or r <= rb):
-        return "BUY"
-    if cross_down and (r is None or r >= rs):
-        return "SELL"
-    return "HOLD"
+# 你可以按需要打开/关闭不同策略模块
+ENABLE_SPOT_STRATEGY = False      # 现货 K 线策略
+ENABLE_FUTURES_STRATEGY = False   # 合约 K 线 / 多空策略
+ENABLE_MANUAL_TEST = False        # 手工测试单 / 旧逻辑迁移区
 
-def signal_mean_revert(closes, p):
-    # 备用：价格偏离均线Z-score阈值做反转
-    n = p.get("mr_len", 20)
-    if len(closes) < n+2: return "HOLD"
-    mu = mean(closes[-n:])
-    std = (sum((x-mu)**2 for x in closes[-n:])/n)**0.5 or 1e-9
-    z = (closes[-1]-mu)/std
-    buy_z = p.get("mr_buy_z", -1.0)
-    sell_z= p.get("mr_sell_z", +1.0)
-    if z <= buy_z:  return "BUY"
-    if z >= sell_z: return "SELL"
-    return "HOLD"
 
-def route_signal(strategy_name, closes, params):
-    if strategy_name == "sma_rsi":
-        return signal_sma_rsi(closes, params)
-    elif strategy_name == "mean_revert":
-        return signal_mean_revert(closes, params)
-    return "HOLD"
+# ===================== 对外主入口 =====================
+
+def generate_orders(env: Env) -> List[OrderRequest]:
+    """
+    生成本次要执行的所有订单（现货 + 合约混合）。
+
+    当前默认逻辑：
+        - 所有策略开关默认是 False，所以返回 []（不下单）
+        - 你可以逐个把开关改成 True，调试各自的策略模块。
+    """
+    orders: List[OrderRequest] = []
+
+    if ENABLE_SPOT_STRATEGY:
+        orders.extend(_spot_kline_strategy(env))
+
+    if ENABLE_FUTURES_STRATEGY:
+        orders.extend(_futures_kline_strategy(env))
+
+    if ENABLE_MANUAL_TEST:
+        orders.extend(_manual_or_legacy_strategy(env))
+
+    return orders
+
+
+# ===================== 现货 K 线策略（占位） =====================
+
+def _spot_kline_strategy(env: Env) -> List[OrderRequest]:
+    """
+    这里预留给“现货 K 线策略”，例如：
+        - MA5 上穿 MA20 买入
+        - RSI 超卖反弹买入
+        - etc.
+
+    目前只是模板，默认不生成任何订单。
+    你以后可以在这里用 ccxt.okx().fetch_ohlcv(...) 拉 K 线，然后生成 OrderRequest。
+    """
+    signals: List[OrderRequest] = []
+
+    # 示例（伪代码，默认注释掉）：
+    #
+    # import ccxt
+    # okx = ccxt.okx()
+    # ohlcv = okx.fetch_ohlcv("BTC/USDT", timeframe="1h", limit=100)
+    # ... 计算策略 ...
+    # if 出现买入信号:
+    #     signals.append(
+    #         OrderRequest(
+    #             env=env,
+    #             market=MarketType.SPOT,
+    #             symbol="BTC/USDT",
+    #             side=Side.BUY,
+    #             amount=0.001,
+    #             price=None,
+    #             leverage=None,
+    #             position_side=None,
+    #             reason="现货策略信号：XXX",
+    #         )
+    #     )
+
+    return signals
+
+
+# ===================== 合约 K 线 / 多空策略（占位） =====================
+
+def _futures_kline_strategy(env: Env) -> List[OrderRequest]:
+    """
+    这里预留给“合约策略”，例如：
+        - 趋势跟随：突破区间上沿开多，跌破下沿开空
+        - HL/HH 结构判断多空
+        - etc.
+
+    目前也是模板，默认不生成任何订单。
+    """
+    signals: List[OrderRequest] = []
+
+    # 示例（伪代码）：
+    #
+    # import ccxt
+    # okx = ccxt.okx()
+    # ohlcv = okx.fetch_ohlcv("BTC/USDT:USDT", timeframe="4h", limit=200, params={"instType": "SWAP"})
+    # ... 计算多空方向 ...
+    # if 看多:
+    #     signals.append(
+    #         OrderRequest(
+    #             env=env,
+#             market=MarketType.FUTURES,
+#             symbol="BTC/USDT:USDT",
+#             side=Side.BUY,
+#             amount=1,
+#             price=None,
+#             leverage=5,
+#             position_side=None,  # 当前使用单向持仓
+#             reason="合约策略信号：看多",
+#         )
+#     )
+# elif 看空:
+#     signals.append(
+#         OrderRequest(
+#             env=env,
+#             market=MarketType.FUTURES,
+#             symbol="BTC/USDT:USDT",
+#             side=Side.SELL,
+#             amount=1,
+#             price=None,
+#             leverage=5,
+#             position_side=None,
+#             reason="合约策略信号：看空",
+#         )
+#     )
+
+    return signals
+
+
+# ===================== 手工 / 旧逻辑策略（占位） =====================
+
+def _manual_or_legacy_strategy(env: Env) -> List[OrderRequest]:
+    """
+    这里是给你：
+        - 手工测试单
+        - 以前 main_old.py / 老 strategy 的迁移逻辑
+
+    你可以在这里硬编码一些订单，方便调试整条链路。
+    """
+    signals: List[OrderRequest] = []
+
+    # 示例：如果你想测试一下“每次跑都在 DEMO 合约开 1 张多单”，
+    # 只需要把 ENABLE_MANUAL_TEST 改成 True，然后取消下面注释。
+    #
+    # signals.append(
+    #     OrderRequest(
+    #         env=env,
+    #         market=MarketType.FUTURES,
+    #         symbol="BTC/USDT:USDT",
+    #         side=Side.BUY,
+    #         amount=1,
+    #         price=None,
+    #         leverage=3,
+    #         position_side=None,
+    #         reason="手工测试单：DEMO 合约开多 1 张",
+    #     )
+    # )
+
+    return signals
