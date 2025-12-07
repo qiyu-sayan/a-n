@@ -6,8 +6,10 @@
 1. 根据 BOT_ENV 选择 DEMO / LIVE
 2. 初始化 OKX Trader + ccxt 客户端
 3. 查询 USDT 余额（total/free）
-4. 检查合约持仓，按杠杆动态止盈止损（支持分批止盈） -> 生成平仓订单（reduce_only）
-5. 如果余额过低，仅允许平仓，不再开新仓
+   - DEMO: 如果接口不支持，则假定余额充足
+4. 检查合约持仓，按杠杆动态止盈止损（支持分批止盈）
+   - DEMO: 如果接口不支持，则跳过自动止盈止损
+5. 如果余额过低，仅允许平仓，不再开新仓（DEMO 若无法获取余额则认为余额充足）
 6. 调用策略生成新的开仓订单（现货 + 合约 + 动态杠杆）
 7. 风控：
    - 去重
@@ -35,13 +37,9 @@ from bot import strategy
 # 风控 & 参数
 # =============================
 
-# 每次 run-bot 最多执行多少个订单（现货+合约总和）
 MAX_ORDERS_PER_RUN = 6
-
-# 同一市场 + 同一 symbol + 同一方向 + reduce_only，每轮只保留一单
 DEDUPE_SAME_SYMBOL_SIDE = True
 
-# 现货 / 合约 单笔最大名义金额（约，USDT）
 # DEMO 用更大的名义金额加快测试，LIVE 用更小的保护本金
 MAX_SPOT_NOTIONAL_TEST = 20.0
 MAX_FUTURES_NOTIONAL_TEST = 20.0
@@ -49,7 +47,6 @@ MAX_FUTURES_NOTIONAL_TEST = 20.0
 MAX_SPOT_NOTIONAL_LIVE = 10.0
 MAX_FUTURES_NOTIONAL_LIVE = 10.0
 
-# 合约单笔最大张数（再保险）
 MAX_FUTURES_CONTRACTS_PER_ORDER = 100
 
 # 余额门槛：低于这个值时，不再开新仓，只允许平仓
@@ -105,7 +102,6 @@ def _build_okx_clients(env: Env) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
             "apiKey": api_key,
             "secret": secret,
             "password": password,
-            # OKX 模拟盘需要这个头
             "headers": {"x-simulated-trading": "1"},
         }
     else:
@@ -118,7 +114,6 @@ def _build_okx_clients(env: Env) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
             "password": password,
         }
 
-    # 简单检查一下，防止忘记填 secrets
     if not api_key or not secret or not password:
         print("[main] 警告: OKX API Key/Secret/Passphrase 有缺失，"
               "余额/持仓等私有接口会失败。")
@@ -137,10 +132,23 @@ def _build_okx_clients(env: Env) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
     return spot, swap
 
 
+def _get_notional_limits(env: Env) -> Tuple[float, float]:
+    if env == Env.TEST:
+        return MAX_SPOT_NOTIONAL_TEST, MAX_FUTURES_NOTIONAL_TEST
+    else:
+        return MAX_SPOT_NOTIONAL_LIVE, MAX_FUTURES_NOTIONAL_LIVE
 
-def _fetch_usdt_balance(spot_ex: ccxt.Exchange) -> Tuple[float, float]:
+
+def _is_demo_feature_unavailable(err: Exception) -> bool:
+    msg = str(err)
+    return "50038" in msg and "unavailable in demo trading" in msg
+
+
+def _fetch_usdt_balance(env: Env, spot_ex: ccxt.Exchange) -> Tuple[float, float]:
     """
     返回 (total, free) USDT 余额。
+    - DEMO: 如果接口不可用，则假定余额充足，返回一个很大的数
+    - LIVE: 接口错误则返回 0，阻止开新仓
     """
     try:
         bal = spot_ex.fetch_balance()
@@ -150,14 +158,10 @@ def _fetch_usdt_balance(spot_ex: ccxt.Exchange) -> Tuple[float, float]:
         return total, free
     except Exception as e:
         print(f"[main] 获取余额失败: {e}")
+        if env == Env.TEST and _is_demo_feature_unavailable(e):
+            print("[main] DEMO 环境余额接口不可用，假定余额充足。")
+            return 9_999_999.0, 9_999_999.0
         return 0.0, 0.0
-
-
-def _get_notional_limits(env: Env) -> Tuple[float, float]:
-    if env == Env.TEST:
-        return MAX_SPOT_NOTIONAL_TEST, MAX_FUTURES_NOTIONAL_TEST
-    else:
-        return MAX_SPOT_NOTIONAL_LIVE, MAX_FUTURES_NOTIONAL_LIVE
 
 
 # =============================
@@ -175,17 +179,14 @@ def _get_tp_sl_for_leverage(leverage: float) -> Tuple[float, float, float]:
     lev = max(1.0, float(leverage))
 
     if lev <= 5:
-        # 低杠杆：止损宽，止盈更宽，适合吃趋势
         tp1 = 0.05   # +5%
         tp2 = 0.10   # +10%
         sl = -0.03   # -3%
     elif lev <= 10:
-        # 中杠杆：止损稍紧，止盈略收窄
         tp1 = 0.04   # +4%
         tp2 = 0.08   # +8%
         sl = -0.02   # -2%
     else:
-        # 高杠杆（仅 DEMO）：止损更紧，止盈相对较宽
         tp1 = 0.03   # +3%
         tp2 = 0.06   # +6%
         sl = -0.015  # -1.5%
@@ -200,23 +201,23 @@ def _get_tp_sl_for_leverage(leverage: float) -> Tuple[float, float, float]:
 def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[OrderRequest]:
     """
     检查合约持仓，如果达到止盈 / 止损条件，生成平仓订单（reduce_only = True）。
-    目前只在 DEMO 环境启用。
+    DEMO: 如果接口不可用则跳过自动止盈止损（OKX demo 限制）。
     """
-    if env != Env.TEST:
-        return []
-
     close_orders: List[OrderRequest] = []
 
     try:
         positions = fut_ex.fetch_positions(params={"instType": "SWAP"})
     except Exception as e:
         print(f"[main] 获取合约持仓失败: {e}")
+        if env == Env.TEST and _is_demo_feature_unavailable(e):
+            print("[main] DEMO 环境不支持持仓查询，跳过自动止盈止损。")
+            return []
         return []
 
     if not positions:
         return []
 
-    from bot.trader import Side as OrderSide, MarketType, OrderRequest  # 局部导入避免循环
+    from bot.trader import Side as OrderSide  # 局部导入避免循环
 
     for pos in positions:
         try:
@@ -260,7 +261,6 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
             if entry_price <= 0:
                 continue
 
-            # 杠杆（可能在不同字段里）
             lev_raw = (
                 pos.get("leverage")
                 or pos.get("lever")
@@ -274,7 +274,6 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
 
             tp1, tp2, sl = _get_tp_sl_for_leverage(lev)
 
-            # 计算浮动收益率
             if is_long:
                 pnl_pct = (last_price - entry_price) / entry_price
             else:
@@ -284,17 +283,14 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
             side = None
             amount = 0.0
 
-            # 止损优先
             if pnl_pct <= sl:
                 reason = f"合约止损: lev={lev:.1f}x, pnl={pnl_pct*100:.2f}%"
                 side = "sell" if is_long else "buy"
                 amount = abs(size)
-            # 第二档止盈（平全部）
             elif pnl_pct >= tp2:
                 reason = f"合约止盈2: lev={lev:.1f}x, pnl={pnl_pct*100:.2f}%"
                 side = "sell" if is_long else "buy"
                 amount = abs(size)
-            # 第一档止盈（平 50%）
             elif pnl_pct >= tp1:
                 reason = f"合约止盈1: lev={lev:.1f}x, pnl={pnl_pct*100:.2f}%"
                 side = "sell" if is_long else "buy"
@@ -315,7 +311,7 @@ def _generate_futures_close_orders(env: Env, fut_ex: ccxt.Exchange) -> List[Orde
                     side=order_side,
                     amount=amount,
                     price=None,
-                    leverage=None,   # 平仓不需要设置杠杆
+                    leverage=None,
                     position_side=None,
                     reduce_only=True,
                     reason=reason,
@@ -338,17 +334,9 @@ def _apply_risk_controls(
     spot_ex: ccxt.Exchange,
     fut_ex: ccxt.Exchange,
 ) -> List[OrderRequest]:
-    """
-    - 去重：同一 market+symbol+side+reduce_only 每轮只保留一单
-    - 限制总单数：最多 MAX_ORDERS_PER_RUN
-    - 限制单笔规模：
-        * 现货：按 USDT 名义金额限制
-        * 合约：按 USDT 名义金额限制（使用 contractSize）
-    """
     if not orders:
         return []
 
-    # 去重
     if DEDUPE_SAME_SYMBOL_SIDE:
         seen: Dict[tuple, bool] = {}
         deduped: List[OrderRequest] = []
@@ -360,7 +348,6 @@ def _apply_risk_controls(
             deduped.append(o)
         orders = deduped
 
-    # 限制总单数
     if len(orders) > MAX_ORDERS_PER_RUN:
         orders = orders[:MAX_ORDERS_PER_RUN]
 
@@ -425,9 +412,6 @@ def _estimate_notional(
     spot_ex: ccxt.Exchange,
     fut_ex: ccxt.Exchange,
 ) -> float:
-    """
-    估算下单金额（USDT），用于展示。
-    """
     try:
         if req.market == MarketType.SPOT:
             ticker = spot_ex.fetch_ticker(req.symbol)
@@ -506,10 +490,10 @@ def run_once() -> None:
     print(f"[main] 运行环境: {env.value}")
 
     # 0. 查询余额
-    total_usdt, free_usdt = _fetch_usdt_balance(spot_ex)
+    total_usdt, free_usdt = _fetch_usdt_balance(env, spot_ex)
     print(f"[main] 账户 USDT 余额: total={total_usdt:.2f}, free={free_usdt:.2f}")
 
-    # 1. 先生成“合约止盈/止损/分批平仓订单”
+    # 1. 生成“合约止盈/止损/分批平仓订单”
     close_orders = _generate_futures_close_orders(env, fut_ex)
     if close_orders:
         print(f"[main] 检测到 {len(close_orders)} 个平仓订单。")
