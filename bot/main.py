@@ -117,9 +117,22 @@ def _create_exchanges(env: Env) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
         "password": passphrase,
     })
 
+    # 有些 ccxt 版本里 OKX 的 id 不是统一的，这里强制写成 okx，避免后面检查出错
+    try:
+        spot.id = "okx"
+    except Exception:
+        pass
+    try:
+        futures.id = "okx"
+    except Exception:
+        pass
+
     if env == Env.TEST:
-        spot.set_sandbox_mode(True)
-        futures.set_sandbox_mode(True)
+        try:
+            spot.set_sandbox_mode(True)
+            futures.set_sandbox_mode(True)
+        except Exception as e:
+            print(f"[main] 启用 sandbox 模式失败: okx {e}")
 
     return spot, futures
 
