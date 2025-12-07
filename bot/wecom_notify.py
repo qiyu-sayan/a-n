@@ -1,29 +1,43 @@
 # bot/wecom_notify.py
+"""
+企业微信机器人通知模块
+
+使用方式：
+    from bot.wecom_notify import send_wecom_message
+    send_wecom_message("hello world")
+
+需要环境变量/Secrets:
+    WECOM_WEBHOOK  = 企业微信机器人 webhook URL
+"""
+
 import os
+import json
 import requests
 
-# 从环境变量里拿企业微信机器人 Webhook（GitHub Actions 那边已经通过 env 传进来了）
-WEBHOOK = os.environ.get("WECHAT_WEBHOOK", "")
+
+def _get_webhook() -> str:
+    webhook = os.getenv("WECOM_WEBHOOK", "").strip()
+    if not webhook:
+        raise RuntimeError("WECOM_WEBHOOK 未配置，无法发送企业微信消息")
+    return webhook
 
 
-def wecom_notify(text: str) -> None:
+def send_wecom_message(text: str) -> None:
     """
-    发送一条企业微信 Markdown 消息。
-    text: 要发送的文本内容（支持换行）
+    发送一条 markdown 消息到企业微信机器人
     """
-    if not WEBHOOK:
-        print("[wecom] WECHAT_WEBHOOK 未配置，跳过发送")
-        return
+    webhook = _get_webhook()
 
     payload = {
         "msgtype": "markdown",
         "markdown": {
-            "content": text
+            "content": text,
         },
     }
 
     try:
-        resp = requests.post(WEBHOOK, json=payload, timeout=5)
-        print(f"[wecom] status={resp.status_code}, resp={resp.text[:200]}")
+        resp = requests.post(webhook, data=json.dumps(payload), timeout=5)
+        resp.raise_for_status()
     except Exception as e:
-        print(f"[wecom] 发送失败: {e}")
+        # 不抛异常，避免影响主流程；只在日志里打印
+        print(f"[WeCom] 发送失败: {e}")
