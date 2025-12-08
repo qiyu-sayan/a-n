@@ -1,7 +1,16 @@
-import ccxt
-from enum import Enum
+# bot/trader.py
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, Any
+from enum import Enum
+from typing import Optional, Tuple, Dict, Any
+
+import ccxt
+
+
+class MarketType(str, Enum):
+    SPOT = "spot"
+    FUTURES = "futures"
 
 
 class Side(str, Enum):
@@ -16,14 +25,16 @@ class PositionSide(str, Enum):
 
 @dataclass
 class OrderRequest:
+    env: str
+    market: MarketType
     symbol: str
     side: Side
     amount: float
-    price: Optional[float] = None
-    reduce_only: bool = False
-    position_side: Optional[PositionSide] = None
     leverage: Optional[int] = None
-    params: Optional[dict] = None
+    price: Optional[float] = None
+    position_side: Optional[PositionSide] = None
+    reduce_only: bool = False
+    reason: str = ""
 
 
 class Trader:
@@ -32,53 +43,61 @@ class Trader:
         self.spot = spot_ex
         self.fut = fut_ex
 
-    # 兼容旧调用：trader.futures
+    # 兼容旧代码：trader.futures
     @property
     def futures(self):
         return self.fut
 
-    def place_order(self, req: OrderRequest, market_type="futures") -> Any:
-        ex = self.fut if market_type == "futures" else self.spot
-
-        params = req.params.copy() if req.params else {}
-
-        # 合约下单默认参数
-        if market_type == "futures":
-            params.setdefault("tdMode", "cross")
-
-            if req.position_side:
-                params["posSide"] = req.position_side.value
-
-            params["reduceOnly"] = req.reduce_only
-
-        # 调整杠杆
-        if req.leverage and market_type == "futures":
-            try:
-                ex.set_leverage(req.leverage, req.symbol)
-            except Exception as e:
-                print(f"[Trader] set_leverage 失败 {req.symbol}: {e}")
-
+    # ------------------------
+    # 下单
+    # ------------------------
+    def place_order(self, req: OrderRequest) -> Tuple[bool, Dict[str, Any]]:
         try:
-            if req.price is None:
-                order = ex.create_order(
-                    symbol=req.symbol,
-                    type="market",
-                    side=req.side.value,
-                    amount=req.amount,
-                    params=params,
-                )
-            else:
-                order = ex.create_order(
-                    symbol=req.symbol,
-                    type="limit",
-                    side=req.side.value,
-                    price=req.price,
-                    amount=req.amount,
-                    params=params,
-                )
-            print(f"[Trader] 下单成功: {order}")
-            return order
+            ex = self.fut if req.market == MarketType.FUTURES else self.spot
+
+            order_type = "market" if req.price is None else "limit"
+            params: Dict[str, Any] = {}
+
+            # ===== 合约下单参数 =====
+            if req.market == MarketType.FUTURES:
+                # 全仓模式
+                params["tdMode"] = "cross"
+
+                # 双向持仓 posSide
+                if req.position_side:
+                    params["posSide"] = req.position_side.value
+
+                # reduce-only
+                if req.reduce_only:
+                    params["reduceOnly"] = True
+
+                # 杠杆
+                if req.leverage:
+                    try:
+                        ex.set_leverage(
+                            req.leverage,
+                            req.symbol,
+                            params={"mgnMode": "cross"},
+                        )
+                    except Exception:
+                        # 杠杆设置失败不致命，打印即可
+                        pass
+
+            resp = ex.create_order(
+                symbol=req.symbol,
+                type=order_type,
+                side=req.side.value,
+                amount=req.amount,
+                price=req.price,
+                params=params,
+            )
+
+            return True, {"order_id": resp.get("id", ""), "raw": resp}
 
         except Exception as e:
-            print(f"[Trader] 下单失败 {req.symbol}: {e}")
-            return None
+            return False, {"error": str(e)}
+
+    # ------------------------
+    # 预留其他功能
+    # ------------------------
+    # 比如之后可以加：获取持仓、平仓、撤单等
