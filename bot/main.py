@@ -1,9 +1,18 @@
-import os
-import time
-import ccxt
-from trader import Trader
-from strategy import Strategy, FUTURE_SYMBOLS
-from bot.wecom_notify import send_wecom_markdown
+# 兼容两种运行方式：
+# 1) python -m bot.main   （GitHub Actions / 包模式）
+# 2) 直接在 bot 目录里 python main.py （本地快速测试）
+
+try:
+    # 包模式：repo 根目录执行 `python -m bot.main`
+    from bot.trader import Trader
+    from bot.strategy import Strategy, FUTURE_SYMBOLS
+    from bot.wecom_notify import send_wecom_markdown
+except ImportError:
+    # 脚本模式：在 bot 目录下执行 `python main.py`
+    from trader import Trader
+    from strategy import Strategy, FUTURE_SYMBOLS
+    from wecom_notify import send_wecom_markdown
+
 
 
 def create_okx_exchanges():
