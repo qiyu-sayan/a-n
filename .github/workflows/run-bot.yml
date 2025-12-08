@@ -26,7 +26,7 @@ jobs:
       OKX_LIVE_API_PASSPHRASE: ${{ secrets.OKX_LIVE_API_PASSPHRASE }}
 
       # 企业微信机器人 key（保持和你原来的一样）
-      WECOM_BOT_KEY: ${{ secrets.WECOM_BOT_KEY }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
 
     steps:
       - name: Checkout code
