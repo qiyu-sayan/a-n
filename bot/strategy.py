@@ -22,10 +22,16 @@ FUTURE_SYMBOLS = [
     "BTC-USDT-SWAP",
 ]
 
-# 趋势周期：4h
-TF_TREND = os.getenv("STRAT_TF_TREND", "4h")
-# 入场周期：1h
-TF_ENTRY = os.getenv("STRAT_TF_ENTRY", "1h")
+# 多周期：
+TF_TREND = os.getenv("STRAT_TF_TREND", "4h")   # 趋势周期
+TF_ENTRY_1H = os.getenv("STRAT_TF_ENTRY_1H", "1h")
+TF_ENTRY_30M = os.getenv("STRAT_TF_ENTRY_30M", "30m")
+TF_ENTRY_15M = os.getenv("STRAT_TF_ENTRY_15M", "15m")
+
+# 策略模式：conservative / neutral / aggressive
+STRAT_MODE = os.getenv("STRAT_MODE", "neutral").lower()
+if STRAT_MODE not in {"conservative", "neutral", "aggressive"}:
+    STRAT_MODE = "neutral"
 
 # 单笔目标名义金额（USDT），和 main.py / Secrets 中 ORDER_USDT 保持一致
 TARGET_NOTIONAL_USDT = float(os.getenv("ORDER_USDT", "10"))
@@ -39,6 +45,8 @@ LEV_MAX = int(os.getenv("LEV_MAX", "8"))   # 强信号（建议别太大）
 EMA_FAST_4H = 20
 EMA_SLOW_4H = 50
 EMA_ENTRY_1H = 20
+EMA_ENTRY_30M = 20
+EMA_ENTRY_15M = 20
 
 
 # =============================
@@ -59,17 +67,18 @@ def _ema(values: List[float], period: int) -> List[float]:
 
 # ---------- 4h 趋势评估 ----------
 
-def _assess_trend_4h(closes: List[float]) -> Tuple[str, int]:
+def _assess_trend_4h(closes: List[float]) -> Tuple[str, int, str]:
     """
     用 4h EMA20 / EMA50 判断趋势方向 + 粗略强度评分。
 
     返回:
         trend: "up" / "down" / "none"
         score: 0 / 1 / 2  （越大趋势越强）
+        desc: 文本描述
     """
     min_len = max(EMA_FAST_4H, EMA_SLOW_4H) + 5
     if len(closes) < min_len:
-        return "none", 0
+        return "none", 0, "4h K线数据不足"
 
     ema_fast = _ema(closes, EMA_FAST_4H)
     ema_slow = _ema(closes, EMA_SLOW_4H)
@@ -84,91 +93,160 @@ def _assess_trend_4h(closes: List[float]) -> Tuple[str, int]:
     elif last_fast < last_slow:
         trend = "down"
     else:
-        return "none", 0
+        return "none", 0, "4h EMA20 与 EMA50 几乎重合，无趋势"
 
     # 趋势强度：快慢线乖离百分比
-    base = abs(last_fast - last_slow)
     if last_slow != 0:
-        diff_pct = base / abs(last_slow) * 100
+        diff_pct = abs(last_fast - last_slow) / abs(last_slow) * 100
     else:
         diff_pct = 0.0
 
-    # 评分：0 / 1 / 2
-    if diff_pct < 0.3:
-        score = 0          # 几乎缠绕，趋势弱
-    elif diff_pct < 1.0:
+    # 评分：0 / 1 / 2（略微放宽一点）
+    if diff_pct < 0.15:
+        score = 0          # 几乎缠绕，趋势很弱
+    elif diff_pct < 0.6:
         score = 1          # 普通趋势
     else:
         score = 2          # 趋势比较明显
 
-    return trend, score
+    desc = f"{TF_TREND} EMA20/50 趋势：{'多头' if trend == 'up' else '空头'}，乖离约 {diff_pct:.2f}%，score={score}"
+    return trend, score, desc
 
 
-# ---------- 1h 入场信号 ----------
+# ---------- 单一周期入场评分 ----------
 
-def _entry_signal_1h(
+def _entry_score_single_tf(
     closes: List[float],
     trend: str,
-) -> Tuple[str, int]:
+    period: int,
+    tf_name: str,
+) -> Tuple[int, str]:
     """
-    用 1h EMA20 决定是否入场：
+    给单一周期打入场分：
 
-    - 如果 4h 多头趋势：
-        * 上一根在 EMA 下方，这一根收盘站上 EMA -> 多头信号
-    - 如果 4h 空头趋势：
-        * 上一根在 EMA 上方，这一根收盘跌破 EMA -> 空头信号
+    - 只做顺势方向（4h 多头 -> 只考虑多；4h 空头 -> 只考虑空）
+    - 评分规则：
+        * 从反向一侧穿到趋势一侧：2 分（强信号）
+        * 已经在趋势一侧并保持：1 分（普通信号）
+        * 其余：0 分（反向或无信号）
 
     返回:
-        direction: "long" / "short" / "none"
-        score: 0 / 1  （有信号 = 至少 1 分）
+        score: 0 / 1 / 2
+        desc: 文本描述
     """
-    min_len = EMA_ENTRY_1H + 3
+    min_len = period + 3
     if len(closes) < min_len or trend == "none":
-        return "none", 0
+        return 0, f"{tf_name} K线数据不足或无趋势"
 
-    ema_entry = _ema(closes, EMA_ENTRY_1H)
+    ema_vals = _ema(closes, period)
 
-    # 仍然用上一根已收线
     idx = -2
     prev_idx = -3
 
     prev_close = closes[prev_idx]
-    prev_ema = ema_entry[prev_idx]
-
     last_close = closes[idx]
-    last_ema = ema_entry[idx]
+    prev_ema = ema_vals[prev_idx]
+    last_ema = ema_vals[idx]
 
+    side_text = "多" if trend == "up" else "空"
+
+    # 趋势方向：多头 -> 希望价格在 EMA 上方；空头 -> 希望价格在 EMA 下方
     if trend == "up":
-        # 从下往上穿 → 做多
+        # 从下向上穿越 -> 2 分
         if prev_close <= prev_ema and last_close > last_ema:
-            return "long", 1
-    elif trend == "down":
-        # 从上往下穿 → 做空
-        if prev_close >= prev_ema and last_close < last_ema:
-            return "short", 1
+            return 2, f"{tf_name} 收盘价向上穿越 EMA{period}，顺势{side_text}强信号(+2)"
+        # 一直站在 EMA 上方 -> 1 分
+        elif last_close > last_ema:
+            return 1, f"{tf_name} 收盘价位于 EMA{period} 上方，顺势{side_text}普通信号(+1)"
+        else:
+            return 0, f"{tf_name} 收盘价在 EMA{period} 下方，逆势/无信号(+0)"
 
-    return "none", 0
+    else:  # trend == "down"
+        # 从上向下穿越 -> 2 分
+        if prev_close >= prev_ema and last_close < last_ema:
+            return 2, f"{tf_name} 收盘价向下穿越 EMA{period}，顺势{side_text}强信号(+2)"
+        # 一直在 EMA 下方 -> 1 分
+        elif last_close < last_ema:
+            return 1, f"{tf_name} 收盘价位于 EMA{period} 下方，顺势{side_text}普通信号(+1)"
+        else:
+            return 0, f"{tf_name} 收盘价在 EMA{period} 上方，逆势/无信号(+0)"
+
+
+# ---------- 多周期合成入场信号 ----------
+
+def _entry_signal_multi_tf(
+    closes_1h: List[float],
+    closes_30m: List[float],
+    closes_15m: List[float],
+    trend: str,
+) -> Tuple[str, int, str]:
+    """
+    综合 1h + 30m + 15m 得到入场方向和得分。
+
+    direction:
+        "long" / "short" / "none"
+    score:
+        0~6
+    desc:
+        用于 reason 的文本描述
+    """
+    if trend == "none":
+        return "none", 0, "无 4h 趋势，不考虑入场"
+
+    # 单周期评分
+    score_1h, desc_1h = _entry_score_single_tf(
+        closes_1h, trend, EMA_ENTRY_1H, TF_ENTRY_1H
+    )
+    score_30m, desc_30m = _entry_score_single_tf(
+        closes_30m, trend, EMA_ENTRY_30M, TF_ENTRY_30M
+    )
+    score_15m, desc_15m = _entry_score_single_tf(
+        closes_15m, trend, EMA_ENTRY_15M, TF_ENTRY_15M
+    )
+
+    total_score = score_1h + score_30m + score_15m
+
+    # 不同模式的入场门槛
+    if STRAT_MODE == "conservative":
+        threshold = 3
+    elif STRAT_MODE == "aggressive":
+        threshold = 1
+    else:  # neutral
+        threshold = 2
+
+    if total_score < threshold:
+        desc = (
+            f"{TF_ENTRY_1H}/{TF_ENTRY_30M}/{TF_ENTRY_15M} 顺势评分总分={total_score}，"
+            f"未达到模式({STRAT_MODE})入场阈值={threshold}\n"
+            f"- {desc_1h}\n- {desc_30m}\n- {desc_15m}"
+        )
+        return "none", total_score, desc
+
+    direction = "long" if trend == "up" else "short"
+    desc = (
+        f"多周期顺势评分总分={total_score} (mode={STRAT_MODE}, 阈值={threshold})，"
+        f"方向={direction}\n"
+        f"- {desc_1h}\n- {desc_30m}\n- {desc_15m}"
+    )
+    return direction, total_score, desc
 
 
 # ---------- 信号强度 -> 杠杆 ----------
 
 def _choose_leverage(trend_score: int, entry_score: int) -> int:
     """
-    简单评分逻辑：
+    总分 = 趋势强度 (0~2) + 入场强度 (0~6)。
 
-        总分 = 趋势强度 (0~2) + 入场确认 (0/1)
-
-        总分 <= 1  -> LEV_MIN   （3x）
-        总分 == 2  -> LEV_MID   （5x）
-        总分 >= 3  -> LEV_MAX   （8x）
-
-    你以后如果想更激进/更保守，可以调 env 里的 LEV_*。
+    简化映射：
+        total <= 2   -> LEV_MIN
+        3 <= total <= 4 -> LEV_MID
+        total >= 5   -> LEV_MAX
     """
     total = trend_score + entry_score
 
-    if total <= 1:
+    if total <= 2:
         return LEV_MIN
-    elif total == 2:
+    elif total <= 4:
         return LEV_MID
     else:
         return LEV_MAX
@@ -198,7 +276,11 @@ def _build_futures_order(
         side = Side.SELL
         pos_side = PositionSide.SHORT
 
-    reason = f"4h趋势: {trend_desc}; 1h入场: {entry_desc}; 动态杠杆: {lev}x"
+    reason = (
+        f"{trend_desc}\n"
+        f"{entry_desc}\n"
+        f"动态杠杆: {lev}x, 参考价: {ref_price:.4f}, 目标名义金额≈{TARGET_NOTIONAL_USDT} USDT"
+    )
 
     return OrderRequest(
         env=trader.env,
@@ -221,9 +303,9 @@ def generate_orders(trader: Trader) -> List[OrderRequest]:
     """
     策略主入口（被 main.py 调用）：
 
-    - 先用 4h K 线评估趋势方向 + 强度（决定多 / 空 / 不交易 + 部分分数）
-    - 再用 1h K 线判断是否出现「顺势的 EMA20 穿越信号」（决定是否入场 + 额外分数）
-    - 根据 总分 -> 选择杠杆档位（弱 / 中 / 强）
+    - 4h K 线：评估趋势方向 + 强度（决定多 / 空 / 不交易 + 部分分数）
+    - 1h + 30m + 15m：多周期顺势评估，得到入场方向 + 强度分数
+    - 根据 总分 -> 选择杠杆档位（LEV_MIN / MID / MAX）
     - 返回的订单统一交给 main.py 做风控、下单、日志、推送。
     """
     orders: List[OrderRequest] = []
@@ -239,28 +321,36 @@ def generate_orders(trader: Trader) -> List[OrderRequest]:
                 continue
             closes_4h = [c[4] for c in ohlcv_4h]
 
-            trend, trend_score = _assess_trend_4h(closes_4h)
+            trend, trend_score, trend_desc = _assess_trend_4h(closes_4h)
             if trend == "none":
-                print(f"[strategy] {symbol} 4h 无明确趋势，跳过。")
+                print(f"[strategy] {symbol} {trend_desc}，跳过。")
                 continue
 
-            trend_desc = f"{TF_TREND} EMA20/50 { '多头' if trend == 'up' else '空头' } (score={trend_score})"
+            # 1h / 30m / 15m 入场数据
+            ohlcv_1h = fut.fetch_ohlcv(symbol, timeframe=TF_ENTRY_1H, limit=200)
+            ohlcv_30m = fut.fetch_ohlcv(symbol, timeframe=TF_ENTRY_30M, limit=200)
+            ohlcv_15m = fut.fetch_ohlcv(symbol, timeframe=TF_ENTRY_15M, limit=200)
 
-            # 1h 入场数据
-            ohlcv_1h = fut.fetch_ohlcv(symbol, timeframe=TF_ENTRY, limit=200)
             if not ohlcv_1h or len(ohlcv_1h) < 80:
                 print(f"[strategy] {symbol} 1h K线数据不足，跳过。")
                 continue
-            closes_1h = [c[4] for c in ohlcv_1h]
 
-            direction, entry_score = _entry_signal_1h(closes_1h, trend)
+            closes_1h = [c[4] for c in ohlcv_1h]
+            closes_30m = [c[4] for c in ohlcv_30m] if ohlcv_30m else []
+            closes_15m = [c[4] for c in ohlcv_15m] if ohlcv_15m else []
+
+            direction, entry_score, entry_desc = _entry_signal_multi_tf(
+                closes_1h, closes_30m, closes_15m, trend
+            )
+
             if direction == "none":
-                print(f"[strategy] {symbol} 有趋势但暂无线号。")
+                print(
+                    f"[strategy] {symbol} 有 4h 趋势但多周期顺势得分过低："
+                    f"trend_score={trend_score}, entry_score={entry_score}。"
+                )
                 continue
 
-            entry_desc = f"{TF_ENTRY} EMA{EMA_ENTRY_1H} 穿越确认方向={direction} (score={entry_score})"
-
-            # 选择杠杆
+            # 杠杆
             lev = _choose_leverage(trend_score, entry_score)
 
             # 参考价格：用 1h 上一根收盘价
@@ -280,7 +370,7 @@ def generate_orders(trader: Trader) -> List[OrderRequest]:
             print(
                 f"[strategy] 生成 {symbol} 信号: dir={direction}, lev={lev}x, "
                 f"ref_price={ref_price:.4f}, amount~{order.amount:.6f}, "
-                f"trend_score={trend_score}, entry_score={entry_score}"
+                f"trend_score={trend_score}, entry_score={entry_score}, mode={STRAT_MODE}"
             )
 
         except Exception as e:
