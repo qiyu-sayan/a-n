@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Tuple, Optional
 
 import ccxt
@@ -14,45 +14,47 @@ from bot.trader import (
     Trader,
     OrderRequest,
     MarketType,
-    PositionSide,
 )
 
-# 运行环境：test（模拟） / live（实盘）
+
+# =============================
+# 环境定义
+# =============================
+
 class Env:
-    TEST = "test"
-    LIVE = "live"
+    TEST = "test"   # 模拟盘 / sandbox
+    LIVE = "live"   # 实盘
 
 
 def now_ts() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# =============================
+# 预估名义金额
+# =============================
+
 def _estimate_notional(ex: ccxt.Exchange, market: MarketType, symbol: str, amount: float) -> float:
     """
     尝试预估名义金额 = amount * 最新价格。
-    模拟盘很多字段拿不到，这里尽量多个字段兜底。
+    模拟盘有些字段拿不到，这里尽量多种方式兜底。
     """
     try:
-        m = ex.market(symbol)
-        info = m.get("info", {})
-
-        price: Optional[float] = None
-
-        # 先尝试 ticker
-        t = ex.fetch_ticker(symbol)
-        price = (
-            t.get("last")
-            or t.get("close")
-            or t.get("ask")
-            or t.get("bid")
+        ticker = ex.fetch_ticker(symbol)
+        price: Optional[float] = (
+            ticker.get("last")
+            or ticker.get("close")
+            or ticker.get("ask")
+            or ticker.get("bid")
         )
 
-        # 再尝试 info 里的字段
-        if not price:
+        if price is None:
+            # 再从 market.info 里兜一层
+            m = ex.market(symbol)
+            info = m.get("info", {})
             price = info.get("last") or info.get("idxPx") or info.get("markPx")
 
-        # 完全失败则返回 0
-        if not price:
+        if price is None:
             return 0.0
 
         return abs(float(amount)) * float(price)
@@ -61,17 +63,76 @@ def _estimate_notional(ex: ccxt.Exchange, market: MarketType, symbol: str, amoun
         return 0.0
 
 
-# DEMO 默认每笔的固定名义金额（USDT）
+# =============================
+# 风控参数
+# =============================
+
+# 单笔目标名义金额（USDT），同时也作为 DEMO 上限
 ORDER_USDT = float(os.getenv("ORDER_USDT", "10"))
 
-# LIVE 风控
-MAX_ORDERS_PER_RUN = 3
-MAX_FUTURES_NOTIONAL_LIVE = 50_000
-LIVE_RISK_PER_TRADE = 0.05  # 5%
-
-# DEMO 风控：只按固定金额，不用余额
+# DEMO：简单，限制在固定金额
 MAX_FUTURES_NOTIONAL_TEST = ORDER_USDT
 
+# LIVE：严格一点，以后上实盘 / 观测模式再细调
+MAX_ORDERS_PER_RUN = 3
+MAX_FUTURES_NOTIONAL_LIVE = 50_000
+LIVE_RISK_PER_TRADE = 0.05  # 5% 资金风险上限
+
+
+# =============================
+# 创建 OKX 客户端（区分 test / live）
+# =============================
+
+def create_okx_exchanges(env: str) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
+    """
+    根据环境创建 OKX 现货 & 合约客户端：
+    - test: 使用 OKX_PAPER_xxx，并开启 sandbox_mode(True)
+    - live: 使用 OKX_LIVE_xxx，连正式环境
+    """
+    if env == Env.TEST:
+        api_key = os.getenv("OKX_PAPER_API_KEY")
+        api_secret = os.getenv("OKX_PAPER_API_SECRET")
+        api_passphrase = os.getenv("OKX_PAPER_API_PASSPHRASE")
+    else:
+        api_key = os.getenv("OKX_LIVE_API_KEY")
+        api_secret = os.getenv("OKX_LIVE_API_SECRET")
+        api_passphrase = os.getenv("OKX_LIVE_API_PASSPHRASE")
+
+    base_config = {
+        "apiKey": api_key,
+        "secret": api_secret,
+        "password": api_passphrase,
+        "enableRateLimit": True,
+    }
+
+    # 现货客户端（目前策略暂时不用，先建好）
+    spot_ex = ccxt.okx({
+        **base_config,
+        "options": {
+            "defaultType": "spot",
+        },
+    })
+
+    # 合约客户端：defaultType=swap + 默认 USDT 本位
+    fut_ex = ccxt.okx({
+        **base_config,
+        "options": {
+            "defaultType": "swap",
+            "defaultSettle": "usdt",
+        },
+    })
+
+    # 关键：test 环境下打开 sandbox 模式，连 OKX 模拟盘
+    if env == Env.TEST:
+        spot_ex.set_sandbox_mode(True)
+        fut_ex.set_sandbox_mode(True)
+
+    return spot_ex, fut_ex
+
+
+# =============================
+# 风控逻辑
+# =============================
 
 def _apply_risk_controls(
     env: str,
@@ -82,17 +143,16 @@ def _apply_risk_controls(
     """
     返回：[(订单, 预估名义金额)]
     DEMO：无余额检查，只用固定上限裁剪
-    LIVE：严格按余额 + 风险比例裁剪
+    LIVE：按余额 + 风险比例裁剪
     """
     adjusted: List[Tuple[OrderRequest, float]] = []
 
-    # DEMO 模拟盘金额上限
     demo_cap = MAX_FUTURES_NOTIONAL_TEST
 
     live_total_usdt = 0.0
     live_free_usdt = 0.0
 
-    # LIVE 账户余额
+    # LIVE 账户余额（以后上实盘观测模式会用到）
     if env == Env.LIVE:
         try:
             bal = spot_ex.fetch_balance(params={"type": "trade"})
@@ -116,12 +176,11 @@ def _apply_risk_controls(
         # 预估名义金额
         notional = _estimate_notional(ex, req.market, req.symbol, req.amount)
 
-        # ===== DEMO 模式（模拟盘）：无法估价就直接用固定 cap =====
+        # ===== DEMO：很简单，只看是否超过 demo_cap =====
         if env == Env.TEST:
             if notional <= 0:
                 notional = demo_cap
                 print(f"[risk] DEMO 无法预估名义金额 → 使用固定名义金额 {notional}。")
-
             elif notional > demo_cap:
                 scale = demo_cap / notional
                 old_amount = req.amount
@@ -135,7 +194,7 @@ def _apply_risk_controls(
             count += 1
             continue
 
-        # ===== LIVE 模式（实盘）=====
+        # ===== LIVE：以后上实盘时再细调 =====
         if notional <= 0:
             print(f"[risk] LIVE 无法预估名义金额，跳过订单。")
             continue
@@ -167,7 +226,6 @@ def _log_trade(req: OrderRequest, result: dict, env: str, notional: float):
     """写入日志 CSV"""
     path = f"logs/trades_{env}.csv"
     exists = os.path.exists(path)
-
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     with open(path, "a", newline="", encoding="utf8") as f:
@@ -190,19 +248,17 @@ def _log_trade(req: OrderRequest, result: dict, env: str, notional: float):
         )
 
 
+# =============================
+# 主流程
+# =============================
+
 def run_once(env: str):
     print(f"[main] 运行环境: {env}")
     if env == Env.TEST:
-        print("Notice：当前为 DEMO 模拟盘环境，用于调试策略与风控逻辑，请勿视为实盘。")
+        print("Notice: 当前为 DEMO 模拟盘环境，用于调试策略与风控逻辑，请勿视为实盘。")
 
-    # 创建客户端（目前统一用模拟盘 API）
-    spot_ex = ccxt.okx({
-        "apiKey": os.getenv("OKX_PAPER_API_KEY"),
-        "secret": os.getenv("OKX_PAPER_API_SECRET"),
-        "password": os.getenv("OKX_PAPER_API_PASSPHRASE"),
-    })
-
-    fut_ex = spot_ex  # 先共用一个客户端即可
+    # 创建 OKX 客户端（这里已经区分 test / live，并在 test 下开启 sandbox）
+    spot_ex, fut_ex = create_okx_exchanges(env)
 
     trader = Trader(env, spot_ex, fut_ex)
 
@@ -225,9 +281,11 @@ def run_once(env: str):
     wecom_msgs = []
     success_count = 0
 
-    # 执行下单
     for req, notional in adjusted:
-        print(f"[main] (FUT) 下单: {req.symbol} {req.side.value} amount={req.amount}, lev={req.leverage}")
+        print(
+            f"[main] (FUT) 下单: {req.symbol} {req.side.value} "
+            f"amount={req.amount}, lev={req.leverage}"
+        )
 
         ok, result = trader.place_order(req)
 
@@ -238,7 +296,8 @@ def run_once(env: str):
                 f"【成功】{req.symbol} {req.side.value}\n"
                 f"数量: {req.amount}\n"
                 f"杠杆: {req.leverage}x\n"
-                f"notional≈{notional}"
+                f"notional≈{notional}\n"
+                f"order_id: {order_id}"
             )
             wecom_msgs.append(msg)
             _log_trade(req, result, env, notional)
@@ -251,18 +310,17 @@ def run_once(env: str):
 
         print("[main] 下单结果:", ok, result)
 
-    # 发送企业微信通知
+    # 企业微信通知
     if wecom_msgs:
-        md = "### 交易机器人执行结果 - DEMO (OKX 模拟盘)\n"
-        for m in wecom_msgs:
-            md += m + "\n\n"
+        title = "### 交易机器人执行结果 - DEMO (OKX 模拟盘)\n"
+        md = title + "\n\n".join(wecom_msgs)
         send_wecom_markdown(md)
 
     print(f"[main] 本轮完成：成功 {success_count} / {len(adjusted)}")
 
 
 def main():
-    env = os.getenv("BOT_ENV", "test")
+    env = os.getenv("BOT_ENV", Env.TEST)
     run_once(env)
 
 
