@@ -22,6 +22,12 @@ FUTURE_SYMBOLS = [
     "BTC-USDT-SWAP",
 ]
 
+# 每个合约的最小下单数量（按 OKX 要求；可以以后再扩展/修改）
+MIN_QTY = {
+    "ETH-USDT-SWAP": 0.01,
+    "BTC-USDT-SWAP": 0.001,
+}
+
 # 多周期：
 TF_TREND = os.getenv("STRAT_TF_TREND", "4h")   # 趋势周期
 TF_ENTRY_1H = os.getenv("STRAT_TF_ENTRY_1H", "1h")
@@ -252,7 +258,7 @@ def _choose_leverage(trend_score: int, entry_score: int) -> int:
         return LEV_MAX
 
 
-# ---------- 构造订单 ----------
+# ---------- 构造订单（带最小下单单位） ----------
 
 def _build_futures_order(
     trader: Trader,
@@ -269,6 +275,15 @@ def _build_futures_order(
     else:
         amount = TARGET_NOTIONAL_USDT / ref_price
 
+    # 这里加入最小下单单位自动补足逻辑
+    min_qty = MIN_QTY.get(symbol, 0.0)
+    if amount < min_qty:
+        print(
+            f"[strategy] {symbol} 计算得到的数量 {amount:.6f} 小于最小下单单位 {min_qty}, "
+            f"自动提升到 {min_qty}。"
+        )
+        amount = min_qty
+
     if direction == "long":
         side = Side.BUY
         pos_side = PositionSide.LONG
@@ -279,7 +294,8 @@ def _build_futures_order(
     reason = (
         f"{trend_desc}\n"
         f"{entry_desc}\n"
-        f"动态杠杆: {lev}x, 参考价: {ref_price:.4f}, 目标名义金额≈{TARGET_NOTIONAL_USDT} USDT"
+        f"动态杠杆: {lev}x, 参考价: {ref_price:.4f}, 目标名义金额≈{TARGET_NOTIONAL_USDT} USDT "
+        f"(实际数量已不低于最小单位 {min_qty})"
     )
 
     return OrderRequest(
@@ -306,7 +322,7 @@ def generate_orders(trader: Trader) -> List[OrderRequest]:
     - 4h K 线：评估趋势方向 + 强度（决定多 / 空 / 不交易 + 部分分数）
     - 1h + 30m + 15m：多周期顺势评估，得到入场方向 + 强度分数
     - 根据 总分 -> 选择杠杆档位（LEV_MIN / MID / MAX）
-    - 返回的订单统一交给 main.py 做风控、下单、日志、推送。
+    - 构造订单时保证数量 ≥ OKX 最小下单单位
     """
     orders: List[OrderRequest] = []
 
