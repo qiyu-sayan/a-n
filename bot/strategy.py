@@ -1,5 +1,27 @@
 from typing import List
-from trader import OrderRequest, Side, PositionSide
+# 兼容两种运行方式：
+# 1）仓库根目录：python -m bot.main
+# 2）进入 bot 目录：python strategy.py / main.py 做本地测试
+
+try:
+    # 包模式
+    from bot.trader import (
+        Trader,
+        OrderRequest,
+        MarketType,
+        Side,
+        PositionSide,
+    )
+except ImportError:
+    # 脚本模式
+    from trader import (
+        Trader,
+        OrderRequest,
+        MarketType,
+        Side,
+        PositionSide,
+    )
+
 
 # ccxt 标准合约符号
 FUTURE_SYMBOLS = [
