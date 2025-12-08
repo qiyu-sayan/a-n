@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import os
-from typing import List
+from typing import List, Tuple
 
 from bot.trader import (
     Trader,
     OrderRequest,
-    Env,
     MarketType,
     Side,
     PositionSide,
@@ -17,29 +16,29 @@ from bot.trader import (
 # 策略配置
 # =============================
 
-# 需要交易的合约品种（OKX 永续）
+# 交易品种：ETH / BTC 合约
 FUTURE_SYMBOLS = [
     "ETH-USDT-SWAP",
     "BTC-USDT-SWAP",
 ]
 
-# 使用的 K 线周期，默认 4 小时
-# 机器人每 15 分钟跑一次，但信号仍然基于 4h 级别
-TIMEFRAME = os.getenv("STRAT_TIMEFRAME", "4h")
+# 趋势周期：4h
+TF_TREND = os.getenv("STRAT_TF_TREND", "4h")
+# 入场周期：1h
+TF_ENTRY = os.getenv("STRAT_TF_ENTRY", "1h")
 
-# 单笔目标名义金额（USDT），默认跟 main.py 里的 ORDER_USDT 一致
+# 单笔目标名义金额（USDT），和 main.py / Secrets 中 ORDER_USDT 保持一致
 TARGET_NOTIONAL_USDT = float(os.getenv("ORDER_USDT", "10"))
 
-# 默认合约杠杆
-DEFAULT_FUT_LEVERAGE = int(os.getenv("FUT_LEVERAGE", "5"))
+# 杠杆档位：信号越强，用的杠杆越高，但不超过 MAX
+LEV_MIN = int(os.getenv("LEV_MIN", "3"))   # 弱信号
+LEV_MID = int(os.getenv("LEV_MID", "5"))   # 中等信号
+LEV_MAX = int(os.getenv("LEV_MAX", "8"))   # 强信号（建议别太大）
 
 # EMA 周期
-EMA_FAST = 20
-EMA_SLOW = 50
-
-# 放量因子：最新一根 K 线成交量 > 最近 N 根平均 * VOL_FACTOR 才算“放量”
-VOL_LOOKBACK = 20
-VOL_FACTOR = 1.2
+EMA_FAST_4H = 20
+EMA_SLOW_4H = 50
+EMA_ENTRY_1H = 20
 
 
 # =============================
@@ -47,7 +46,7 @@ VOL_FACTOR = 1.2
 # =============================
 
 def _ema(values: List[float], period: int) -> List[float]:
-    """简单 EMA 实现，返回同长度列表。"""
+    """简单 EMA 实现。"""
     if not values or period <= 1:
         return values[:]
 
@@ -55,102 +54,151 @@ def _ema(values: List[float], period: int) -> List[float]:
     ema_vals: List[float] = [values[0]]
     for v in values[1:]:
         ema_vals.append(alpha * v + (1 - alpha) * ema_vals[-1])
-
     return ema_vals
 
 
-def _calc_trend_signals(closes: List[float], volumes: List[float]) -> str:
-    """
-    根据 EMA20 / EMA50 + 放量判断多空信号：
+# ---------- 4h 趋势评估 ----------
 
-    使用「上一根已经收盘的 K 线」做信号，避免未收线乱抖。
+def _assess_trend_4h(closes: List[float]) -> Tuple[str, int]:
+    """
+    用 4h EMA20 / EMA50 判断趋势方向 + 粗略强度评分。
 
     返回:
-        "long"  -> 做多信号
-        "short" -> 做空信号
-        "none"  -> 无信号
+        trend: "up" / "down" / "none"
+        score: 0 / 1 / 2  （越大趋势越强）
     """
-    min_len = max(EMA_FAST, EMA_SLOW) + 3  # 至少多几根方便取前一根
+    min_len = max(EMA_FAST_4H, EMA_SLOW_4H) + 5
     if len(closes) < min_len:
-        return "none"
+        return "none", 0
 
-    ema_fast = _ema(closes, EMA_FAST)
-    ema_slow = _ema(closes, EMA_SLOW)
+    ema_fast = _ema(closes, EMA_FAST_4H)
+    ema_slow = _ema(closes, EMA_SLOW_4H)
 
-    # 使用上一根收盘 K 线作为信号基础
-    idx = -2         # 上一根已收线
-    prev_idx = -3    # 上上一根
-
-    last_close = closes[idx]
+    # 用上一根收盘 K（已收线）
+    idx = -2
     last_fast = ema_fast[idx]
     last_slow = ema_slow[idx]
 
-    prev_fast = ema_fast[prev_idx]
-    prev_slow = ema_slow[prev_idx]
-
-    # 成交量：上一根 vs 前若干根平均
-    if len(volumes) + prev_idx <= 0:
-        return "none"
-
-    last_vol = volumes[idx]
-    start = max(0, idx - VOL_LOOKBACK)  # [start, idx) 不含 idx
-    if idx - start <= 0:
-        avg_vol = sum(volumes[:idx]) / max(idx, 1)
+    if last_fast > last_slow:
+        trend = "up"
+    elif last_fast < last_slow:
+        trend = "down"
     else:
-        avg_vol = sum(volumes[start:idx]) / (idx - start)
+        return "none", 0
 
-    is_volume_spike = last_vol > avg_vol * VOL_FACTOR
+    # 趋势强度：快慢线乖离百分比
+    base = abs(last_fast - last_slow)
+    if last_slow != 0:
+        diff_pct = base / abs(last_slow) * 100
+    else:
+        diff_pct = 0.0
 
-    # 快慢 EMA 当前趋势
-    is_up_trend = last_fast > last_slow
-    is_down_trend = last_fast < last_slow
+    # 评分：0 / 1 / 2
+    if diff_pct < 0.3:
+        score = 0          # 几乎缠绕，趋势弱
+    elif diff_pct < 1.0:
+        score = 1          # 普通趋势
+    else:
+        score = 2          # 趋势比较明显
 
-    # 关注“交叉”：
-    # 多头：上一根 fast 从下向上穿 slow，且收盘在 fast 之上
-    crossed_up = (prev_fast <= prev_slow) and (last_fast > last_slow)
-    # 空头：上一根 fast 从上向下穿 slow，且收盘在 fast 之下
-    crossed_down = (prev_fast >= prev_slow) and (last_fast < last_slow)
+    return trend, score
 
-    is_bull_break = last_close > last_fast
-    is_bear_break = last_close < last_fast
 
-    # 简单规则：
-    # 1）快线向上金叉 + 多头趋势 + 收盘在快线之上 + 放量 -> 做多信号
-    if crossed_up and is_up_trend and is_bull_break and is_volume_spike:
-        return "long"
+# ---------- 1h 入场信号 ----------
 
-    # 2）快线向下死叉 + 空头趋势 + 收盘在快线之下 + 放量 -> 做空信号
-    if crossed_down and is_down_trend and is_bear_break and is_volume_spike:
-        return "short"
+def _entry_signal_1h(
+    closes: List[float],
+    trend: str,
+) -> Tuple[str, int]:
+    """
+    用 1h EMA20 决定是否入场：
 
-    return "none"
+    - 如果 4h 多头趋势：
+        * 上一根在 EMA 下方，这一根收盘站上 EMA -> 多头信号
+    - 如果 4h 空头趋势：
+        * 上一根在 EMA 上方，这一根收盘跌破 EMA -> 空头信号
 
+    返回:
+        direction: "long" / "short" / "none"
+        score: 0 / 1  （有信号 = 至少 1 分）
+    """
+    min_len = EMA_ENTRY_1H + 3
+    if len(closes) < min_len or trend == "none":
+        return "none", 0
+
+    ema_entry = _ema(closes, EMA_ENTRY_1H)
+
+    # 仍然用上一根已收线
+    idx = -2
+    prev_idx = -3
+
+    prev_close = closes[prev_idx]
+    prev_ema = ema_entry[prev_idx]
+
+    last_close = closes[idx]
+    last_ema = ema_entry[idx]
+
+    if trend == "up":
+        # 从下往上穿 → 做多
+        if prev_close <= prev_ema and last_close > last_ema:
+            return "long", 1
+    elif trend == "down":
+        # 从上往下穿 → 做空
+        if prev_close >= prev_ema and last_close < last_ema:
+            return "short", 1
+
+    return "none", 0
+
+
+# ---------- 信号强度 -> 杠杆 ----------
+
+def _choose_leverage(trend_score: int, entry_score: int) -> int:
+    """
+    简单评分逻辑：
+
+        总分 = 趋势强度 (0~2) + 入场确认 (0/1)
+
+        总分 <= 1  -> LEV_MIN   （3x）
+        总分 == 2  -> LEV_MID   （5x）
+        总分 >= 3  -> LEV_MAX   （8x）
+
+    你以后如果想更激进/更保守，可以调 env 里的 LEV_*。
+    """
+    total = trend_score + entry_score
+
+    if total <= 1:
+        return LEV_MIN
+    elif total == 2:
+        return LEV_MID
+    else:
+        return LEV_MAX
+
+
+# ---------- 构造订单 ----------
 
 def _build_futures_order(
     trader: Trader,
     symbol: str,
-    signal: str,
-    last_price: float,
+    direction: str,
+    ref_price: float,
+    lev: int,
+    trend_desc: str,
+    entry_desc: str,
 ) -> OrderRequest:
-    """
-    由信号构造一个 OrderRequest（只开仓，不平仓，reduce_only=False）。
-    """
-    # 目标名义金额 -> 数量
-    notional = TARGET_NOTIONAL_USDT
-    if last_price <= 0:
-        # 极端情况，防止除零，给一个非常小的默认数量
+    """根据方向 + 杠杆 + 参考价格构造 OrderRequest。"""
+    if ref_price <= 0:
         amount = 0.001
     else:
-        amount = notional / last_price
+        amount = TARGET_NOTIONAL_USDT / ref_price
 
-    if signal == "long":
+    if direction == "long":
         side = Side.BUY
         pos_side = PositionSide.LONG
-        reason = f"{TIMEFRAME} EMA 金叉多头 + 放量"
-    else:  # "short"
+    else:
         side = Side.SELL
         pos_side = PositionSide.SHORT
-        reason = f"{TIMEFRAME} EMA 死叉空头 + 放量"
+
+    reason = f"4h趋势: {trend_desc}; 1h入场: {entry_desc}; 动态杠杆: {lev}x"
 
     return OrderRequest(
         env=trader.env,
@@ -158,7 +206,7 @@ def _build_futures_order(
         symbol=symbol,
         side=side,
         amount=amount,
-        leverage=DEFAULT_FUT_LEVERAGE,
+        leverage=lev,
         position_side=pos_side,
         reduce_only=False,
         reason=reason,
@@ -171,16 +219,12 @@ def _build_futures_order(
 
 def generate_orders(trader: Trader) -> List[OrderRequest]:
     """
-    策略主入口（main.py 会直接调用这个函数）。
+    策略主入口（被 main.py 调用）：
 
-    当前逻辑：
-    - 只做 OKX 合约（SWAP）
-    - 使用 4 小时 K 线做趋势+放量判断
-    - 对 ETH / BTC 两个品种分别：
-        * 计算 EMA20 / EMA50
-        * 用“上一根收盘 K 线”的 EMA 金叉/死叉 + 放量判定多空信号
-        * 有信号 -> 生成一个对应方向的开仓订单
-    - 返回的订单会交给 main.py 做统一风控、下单、记录、推送。
+    - 先用 4h K 线评估趋势方向 + 强度（决定多 / 空 / 不交易 + 部分分数）
+    - 再用 1h K 线判断是否出现「顺势的 EMA20 穿越信号」（决定是否入场 + 额外分数）
+    - 根据 总分 -> 选择杠杆档位（弱 / 中 / 强）
+    - 返回的订单统一交给 main.py 做风控、下单、日志、推送。
     """
     orders: List[OrderRequest] = []
 
@@ -188,30 +232,55 @@ def generate_orders(trader: Trader) -> List[OrderRequest]:
 
     for symbol in FUTURE_SYMBOLS:
         try:
-            # 获取 K 线数据： [timestamp, open, high, low, close, volume]
-            ohlcv = fut.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=120)
-            if not ohlcv or len(ohlcv) < 60:
-                print(f"[strategy] {symbol} K线数据不足，跳过。")
+            # 4h 趋势数据
+            ohlcv_4h = fut.fetch_ohlcv(symbol, timeframe=TF_TREND, limit=120)
+            if not ohlcv_4h or len(ohlcv_4h) < 60:
+                print(f"[strategy] {symbol} 4h K线数据不足，跳过。")
+                continue
+            closes_4h = [c[4] for c in ohlcv_4h]
+
+            trend, trend_score = _assess_trend_4h(closes_4h)
+            if trend == "none":
+                print(f"[strategy] {symbol} 4h 无明确趋势，跳过。")
                 continue
 
-            closes = [c[4] for c in ohlcv]
-            vols = [c[5] for c in ohlcv]
+            trend_desc = f"{TF_TREND} EMA20/50 { '多头' if trend == 'up' else '空头' } (score={trend_score})"
 
-            signal = _calc_trend_signals(closes, vols)
+            # 1h 入场数据
+            ohlcv_1h = fut.fetch_ohlcv(symbol, timeframe=TF_ENTRY, limit=200)
+            if not ohlcv_1h or len(ohlcv_1h) < 80:
+                print(f"[strategy] {symbol} 1h K线数据不足，跳过。")
+                continue
+            closes_1h = [c[4] for c in ohlcv_1h]
 
-            if signal == "none":
-                print(f"[strategy] {symbol} 当前无信号。")
+            direction, entry_score = _entry_signal_1h(closes_1h, trend)
+            if direction == "none":
+                print(f"[strategy] {symbol} 有趋势但暂无线号。")
                 continue
 
-            # last_price 用上一根收盘价
-            last_price = closes[-2]
+            entry_desc = f"{TF_ENTRY} EMA{EMA_ENTRY_1H} 穿越确认方向={direction} (score={entry_score})"
 
-            order = _build_futures_order(trader, symbol, signal, last_price)
+            # 选择杠杆
+            lev = _choose_leverage(trend_score, entry_score)
+
+            # 参考价格：用 1h 上一根收盘价
+            ref_price = closes_1h[-2]
+
+            order = _build_futures_order(
+                trader=trader,
+                symbol=symbol,
+                direction=direction,
+                ref_price=ref_price,
+                lev=lev,
+                trend_desc=trend_desc,
+                entry_desc=entry_desc,
+            )
             orders.append(order)
 
             print(
-                f"[strategy] 生成 {symbol} 信号: {signal}, "
-                f"last_price={last_price:.4f}, amount~{order.amount:.6f}"
+                f"[strategy] 生成 {symbol} 信号: dir={direction}, lev={lev}x, "
+                f"ref_price={ref_price:.4f}, amount~{order.amount:.6f}, "
+                f"trend_score={trend_score}, entry_score={entry_score}"
             )
 
         except Exception as e:
