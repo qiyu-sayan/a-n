@@ -25,7 +25,7 @@ FUTURE_SYMBOLS = [
 # 每个合约的最小下单数量（按 OKX 要求；可以以后再扩展/修改）
 MIN_QTY = {
     "ETH-USDT-SWAP": 0.01,
-    "BTC-USDT-SWAP": 0.001,
+    "BTC-USDT-SWAP": 0.01,
 }
 
 # 多周期：
