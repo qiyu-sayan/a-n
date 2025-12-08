@@ -300,14 +300,19 @@ def _apply_risk_controls(
         ex = spot_ex if req.market == MarketType.SPOT else fut_ex
         notional = _estimate_notional(ex, req.market, req.symbol, req.amount)
 
-        if notional <= 0:
-            print(f"[risk] 无法预估名义金额，跳过: {req}")
-            continue
-
-        # DEMO 环境：只按固定 U 上限裁剪
+        # ---------- DEMO 环境：用固定上限作为名义金额兜底 ----------
         if env == Env.TEST:
             cap = demo_spot_cap if req.market == MarketType.SPOT else demo_fut_cap
-            if notional > cap:
+
+            if notional <= 0:
+                # 在 OKX 模拟盘上往往拿不到价格，这里直接用 cap 作为名义金额
+                notional = cap
+                print(
+                    f"[risk] DEMO 环境无法预估名义金额，"
+                    f"使用固定上限 notional={notional:.2f} 继续下单。"
+                )
+            elif notional > cap:
+                # 超过上限就按比例缩小仓位
                 scale = cap / notional
                 old_amount = req.amount
                 req.amount *= scale
@@ -316,7 +321,13 @@ def _apply_risk_controls(
                     f"[risk] DEMO 名义金额 {old_amount:.4f} 超出上限，"
                     f"调整为 amount={req.amount:.6f}, notional={notional:.2f}"
                 )
+
+        # ---------- LIVE 环境：严格按余额 + 风险比例控制 ----------
         else:
+            if notional <= 0:
+                print(f"[risk] 无法预估名义金额，跳过: {req}")
+                continue
+
             # LIVE 环境：上限 = min(绝对 U 上限, 余额 * 比例) + 不超过可用余额
             abs_cap = MAX_SPOT_NOTIONAL_LIVE if req.market == MarketType.SPOT else MAX_FUTURES_NOTIONAL_LIVE
             dyn_cap = live_total_usdt * LIVE_RISK_PER_TRADE
@@ -342,6 +353,7 @@ def _apply_risk_controls(
         order_count += 1
 
     return adjusted
+
 
 
 # =============================
