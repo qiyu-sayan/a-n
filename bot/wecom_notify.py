@@ -30,7 +30,8 @@ def send_wecom_message(text: str) -> None:
 
 def send_wecom_markdown(text: str) -> None:
     """
-    与 main.py 保持兼容的 markdown 通知。
-    企业微信 markdown 要求 msgtype=markdown，但这里先用文本发，保持兼容。
+    兼容 main.py 的 markdown 推送接口，目前内部就用纯文本发。
+    以后如果你想用真正 markdown，可以在这里改 msgtype=markdown。
     """
     send_wecom_message(text)
+
