@@ -9,12 +9,11 @@ from typing import List, Tuple, Optional
 import ccxt
 
 from bot.strategy import generate_orders
-from bot.wecom_notify import send_wecom_message  # 你的 wecom_notify 里是 send_wecom_message
+from bot.wecom_notify import send_wecom_markdown
 from bot.trader import (
     Trader,
     OrderRequest,
     MarketType,
-    PositionSide,
 )
 from bot.virtual_pnl import VirtualPositionManager, ClosedTrade
 
@@ -67,13 +66,13 @@ def _estimate_notional(ex: ccxt.Exchange, market: MarketType, symbol: str, amoun
 # 风控参数
 # =============================
 
-ORDER_USDT = float(os.getenv("ORDER_USDT", "10"))  # 策略里也会用到
+ORDER_USDT = float(os.getenv("ORDER_USDT", "10"))
 
 MAX_ORDERS_PER_RUN = 3
 MAX_FUTURES_NOTIONAL_LIVE = 50_000
-LIVE_RISK_PER_TRADE = 0.05  # 5%
+LIVE_RISK_PER_TRADE = 0.05
 
-MAX_FUTURES_NOTIONAL_TEST = ORDER_USDT  # DEMO 时只是用来估算和打印
+MAX_FUTURES_NOTIONAL_TEST = ORDER_USDT
 
 
 # =============================
@@ -100,7 +99,6 @@ def create_okx_exchanges(env: str) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
     spot_ex = ccxt.okx({**base_config, "options": {"defaultType": "spot"}})
     fut_ex = ccxt.okx({**base_config, "options": {"defaultType": "swap", "defaultSettle": "usdt"}})
 
-    # 测试环境打开模拟盘
     if env == Env.TEST:
         spot_ex.set_sandbox_mode(True)
         fut_ex.set_sandbox_mode(True)
@@ -124,14 +122,13 @@ def _apply_risk_controls(
     TEST（模拟盘）：
         - 不缩小数量，只估算名义金额供观测使用
     LIVE（实盘）：
-        - 按余额 + 风险比例裁剪
+        - 按余额 + 风险比例裁剪（预留）
     """
     adjusted: List[Tuple[OrderRequest, float]] = []
 
     live_total_usdt = 0.0
     live_free_usdt = 0.0
 
-    # LIVE 账户余额
     if env == Env.LIVE:
         try:
             bal = spot_ex.fetch_balance(params={"type": "trade"})
@@ -153,7 +150,6 @@ def _apply_risk_controls(
         ex = fut_ex if req.market == MarketType.FUTURES else spot_ex
         notional = _estimate_notional(ex, req.market, req.symbol, req.amount)
 
-        # TEST：只估算，不缩量
         if env == Env.TEST:
             if notional <= 0:
                 notional = MAX_FUTURES_NOTIONAL_TEST
@@ -167,7 +163,7 @@ def _apply_risk_controls(
             count += 1
             continue
 
-        # LIVE：严格限制
+        # LIVE：严格裁剪（以后上实盘再用）
         if notional <= 0:
             print(f"[risk] LIVE 无法预估名义金额，跳过订单。")
             continue
@@ -249,7 +245,7 @@ def _get_fill_price(ex: ccxt.Exchange, symbol: str) -> Optional[float]:
 
 
 # =============================
-# 主流程
+# 主流程（单轮运行）
 # =============================
 
 def run_once(env: str):
@@ -261,13 +257,11 @@ def run_once(env: str):
     trader = Trader(env, spot_ex, fut_ex)
     vp_manager = VirtualPositionManager(env)
 
-    # 生成策略信号
     raw_orders = generate_orders(trader)
     if not raw_orders:
         print("[main] 本次无交易信号。")
         return
 
-    # 风控
     adjusted = _apply_risk_controls(env, spot_ex, fut_ex, raw_orders)
     if not adjusted:
         print("[main] 风控后无有效订单，退出。")
@@ -287,13 +281,17 @@ def run_once(env: str):
 
         ok, result = trader.place_order(req)
 
-        # 获取用于虚拟开平仓的“成交价”
-        fill_price = _get_fill_price(fut_ex if req.market == MarketType.FUTURES else spot_ex)
         closed: Optional[ClosedTrade] = None
-        if ok and fill_price is not None and req.market == MarketType.FUTURES:
-            closed = vp_manager.on_order_filled(req, fill_price)
-            if closed:
-                closed_trades.append(closed)
+        if ok:
+            try:
+                ex = fut_ex if req.market == MarketType.FUTURES else spot_ex
+                fill_price = _get_fill_price(ex, req.symbol)
+                if fill_price is not None and req.market == MarketType.FUTURES:
+                    closed = vp_manager.on_order_filled(req, fill_price)
+                    if closed:
+                        closed_trades.append(closed)
+            except Exception as e:
+                print(f"[virtual] 处理虚拟持仓时出错: {e}")
 
         if ok:
             success_count += 1
@@ -322,7 +320,6 @@ def run_once(env: str):
 
         print("[main] 下单结果:", ok, result)
 
-    # 汇总本轮虚拟平仓情况
     if closed_trades:
         wins = sum(1 for t in closed_trades if t.pnl > 0)
         total = len(closed_trades)
@@ -334,17 +331,33 @@ def run_once(env: str):
         wecom_msgs.append(summary)
         print("[virtual] " + summary)
 
-    # WeCom 推送（用的是 wecom_notify 里的 send_wecom_message）
     if wecom_msgs:
-        text = "【交易机器人执行结果 - DEMO (OKX 模拟盘)】\n\n" + "\n\n".join(wecom_msgs)
-        send_wecom_message(text)
+        text = "### 交易机器人执行结果 - DEMO (OKX 模拟盘)\n\n" + "\n\n".join(wecom_msgs)
+        send_wecom_markdown(text)
 
     print(f"[main] 本轮完成：成功 {success_count} / {len(adjusted)}")
 
 
+# =============================
+# 入口：加上错误告警
+# =============================
+
 def main():
     env = os.getenv("BOT_ENV", Env.TEST)
-    run_once(env)
+    try:
+        run_once(env)
+    except Exception as e:
+        import traceback
+        err = traceback.format_exc()
+        print("[main] 运行异常:", err)
+        # 尝试用企业微信报警
+        try:
+            msg = f"【机器人异常】环境: {env}\n\n```\n{err[-1500:]}\n```"
+            send_wecom_markdown(msg)
+        except Exception as e2:
+            print("[WeCom] 发送异常通知失败:", e2)
+        # 继续抛出，让 GitHub Actions 标红
+        raise
 
 
 if __name__ == "__main__":
