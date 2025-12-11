@@ -435,9 +435,9 @@ class OKXTrader:
         从 OKX 获取 K 线数据，返回按时间从旧到新的列表，
         每一项形如: [ts, open, high, low, close, volume]
 
-        兼容两种返回格式：
-        1）OKX 原始 list: [ts, o, h, l, c, vol, ...]
-        2）_request 已封装成 dict: {"ts": ..., "o": ..., "h": ..., "l": ..., "c": ..., "vol": ...}
+        兼容两种情况：
+        1）self._request 返回 dict: {"code": "...", "msg": "...", "data": [...]}
+        2）self._request 已经直接返回 data 列表
         """
         path = "/api/v5/market/candles"
         params = {
@@ -446,10 +446,23 @@ class OKXTrader:
             "limit": str(limit),
         }
 
-        data = self._request("GET", path, params=params)
+        resp = self._request("GET", path, params=params)
+
+        # --- 处理返回格式 ---
+        if isinstance(resp, dict):
+            # 标准 OKX 响应结构
+            code = resp.get("code")
+            if code is not None and code != "0":
+                # 出错就打印一行日志，返回空，不中断整个机器人
+                print(f"OKX raw error response in get_klines: {resp}")
+                return []
+            data = resp.get("data", [])
+        else:
+            # 已经是 data 列表
+            data = resp
 
         rows = []
-        # OKX 一般是「最新在前」，这里统一转成「最老在前」
+        # OKX 通常「最新在前」，这里反转成「最老在前」
         for item in reversed(data):
             # 情况 1：item 是 dict
             if isinstance(item, dict):
@@ -481,7 +494,7 @@ class OKXTrader:
                     float(vol),      # 5: volume
                 ])
             except Exception:
-                # 这一根数据有问题就丢掉，不影响整体
+                # 某一根数据脏了就忽略
                 continue
 
         return rows
