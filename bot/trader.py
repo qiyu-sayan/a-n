@@ -430,14 +430,14 @@ class OKXTrader:
         if short_sz and short_sz != "0":
             self.close_short(inst_id, short_sz)
             
-    def get_klines(self, inst_id: str, bar: str = "1H", limit: int = 200) -> pd.DataFrame:
+    def get_klines(self, inst_id: str, bar: str = "1H", limit: int = 200):
         """
-        从 OKX 获取 K 线数据，返回按时间从旧到新的 DataFrame，
-        列包括: open_time, open, high, low, close, volume
+        从 OKX 获取 K 线数据，返回按时间从旧到新的列表，
+        每一项形如: [ts, open, high, low, close, volume]
 
         兼容两种返回格式：
         1）OKX 原始 list: [ts, o, h, l, c, vol, ...]
-        2）你自己在 _request 里封装过的 dict: {"ts": ..., "o": ..., "h": ..., "l": ..., "c": ..., "vol": ...}
+        2）_request 已封装成 dict: {"ts": ..., "o": ..., "h": ..., "l": ..., "c": ..., "vol": ...}
         """
         path = "/api/v5/market/candles"
         params = {
@@ -449,9 +449,9 @@ class OKXTrader:
         data = self._request("GET", path, params=params)
 
         rows = []
-        # OKX 返回通常是“最新在前”，我们统一反转成“最老在前”
+        # OKX 一般是「最新在前」，这里统一转成「最老在前」
         for item in reversed(data):
-            # --- 情况 1：item 是 dict ---
+            # 情况 1：item 是 dict
             if isinstance(item, dict):
                 ts = item.get("ts") or item.get("t") or item.get("time")
                 o = item.get("o") or item.get("open")
@@ -459,10 +459,10 @@ class OKXTrader:
                 l = item.get("l") or item.get("low")
                 c = item.get("c") or item.get("close") or o
                 vol = item.get("vol") or item.get("volume") or 0
-            # --- 情况 2：item 是 list / tuple ---
+            # 情况 2：item 是 list / tuple
             else:
                 if len(item) < 5:
-                    # 连 ts,o,h,l,c 都凑不够，就跳过
+                    # 连 ts,o,h,l,c 都不够就跳过
                     continue
                 ts = item[0]
                 o = item[1]
@@ -472,22 +472,19 @@ class OKXTrader:
                 vol = item[5] if len(item) > 5 else 0
 
             try:
-                ts_dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
-                rows.append(
-                    {
-                        "open_time": ts_dt,
-                        "open": float(o),
-                        "high": float(h),
-                        "low": float(l),
-                        "close": float(c),
-                        "volume": float(vol),
-                    }
-                )
+                rows.append([
+                    int(ts),         # 0: ts
+                    float(o),        # 1: open
+                    float(h),        # 2: high
+                    float(l),        # 3: low
+                    float(c),        # 4: close
+                    float(vol),      # 5: volume
+                ])
             except Exception:
-                # 某一根数据脏了就忽略，不影响整体
+                # 这一根数据有问题就丢掉，不影响整体
                 continue
 
-        return pd.DataFrame(rows)
+        return rows
 
 
 
