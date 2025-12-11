@@ -129,13 +129,14 @@ def run_once(cfg: Dict[str, Any]) -> None:
             last = trader.get_last_price(inst_id)
         except Exception:
             last = None
-        print(f"[INFO] last price {inst_id} = {last}")
+                print(f"[INFO] last price {inst_id} = {last}")
 
         try:
             if signal == 1:
                 if has_long:
                     print("[ACTION] already long, no new long opened")
                 else:
+                    action_desc = "close_short_then_open_long" if has_short else "open_long"
                     if has_short:
                         print("[ACTION] close_short then open_long")
                         try:
@@ -144,12 +145,27 @@ def run_once(cfg: Dict[str, Any]) -> None:
                             print(f"[WARN] close_short failed: {e}")
                     else:
                         print("[ACTION] open_long (no existing position)")
+
                     trader.open_long(inst_id, ref_price=last)
+
+                    # === 企业微信推送（做多开仓成功后） ===
+                    if send_wecom_text is not None:
+                        msg = (
+                            f"[开多] {symbol} / {inst_id}\n"
+                            f"价格: {last}\n"
+                            f"信号: {info}\n"
+                            f"动作: {action_desc}"
+                        )
+                        try:
+                            send_wecom_text(msg)
+                        except Exception as e:
+                            print(f"[WARN] send_wecom_text failed: {e}")
 
             elif signal == -1:
                 if has_short:
                     print("[ACTION] already short, no new short opened")
                 else:
+                    action_desc = "close_long_then_open_short" if has_long else "open_short"
                     if has_long:
                         print("[ACTION] close_long then open_short")
                         try:
@@ -158,7 +174,21 @@ def run_once(cfg: Dict[str, Any]) -> None:
                             print(f"[WARN] close_long failed: {e}")
                     else:
                         print("[ACTION] open_short (no existing position)")
+
                     trader.open_short(inst_id, ref_price=last)
+
+                    # === 企业微信推送（做空开仓成功后） ===
+                    if send_wecom_text is not None:
+                        msg = (
+                            f"[开空] {symbol} / {inst_id}\n"
+                            f"价格: {last}\n"
+                            f"信号: {info}\n"
+                            f"动作: {action_desc}"
+                        )
+                        try:
+                            send_wecom_text(msg)
+                        except Exception as e:
+                            print(f"[WARN] send_wecom_text failed: {e}")
 
         except Exception as e:
             print(f"[ERROR] trade action failed for {inst_id}: {e}")
