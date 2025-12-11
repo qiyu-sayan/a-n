@@ -1,395 +1,317 @@
-# bot/strategy.py
-from __future__ import annotations
+"""
+strategy.py
 
-import os
-from typing import List, Tuple
+职责：
+- 根据 K 线数据 + 配置，生成交易信号
+- 分两层：
+  1）基础信号层（双均线 + 信号线） -> raw_signal ∈ {-1, 0, 1}
+  2）过滤层（趋势过滤 + RSI + 暴跌保护） -> final_signal ∈ {-1, 0, 1}
 
-from bot.trader import (
-    Trader,
-    OrderRequest,
-    MarketType,
-    Side,
-    PositionSide,
-)
+说明：
+- 本文件不直接下单，只负责“要不要做多/做空/观望”的决策。
+- 可训练参数：cfg["logic"] & cfg["risk"]（交给训练器调）
+- 手动配置参数：cfg["filters"]（只在这里使用，训练器不改）
+"""
 
-# =============================
-# 策略配置
-# =============================
-
-# 交易品种：ETH / BTC 合约（ccxt 统一合约符号）
-FUTURE_SYMBOLS = [
-    "ETH/USDT:USDT",
-    "BTC/USDT:USDT",
-]
-
-# 每个合约的最小下单数量（按 OKX 要求；可以以后再扩展/修改）
-MIN_QTY = {
-    "ETH/USDT:USDT": 0.01,
-    "BTC/USDT:USDT": 0.01,
-}
-
-# 多周期：
-TF_TREND = os.getenv("STRAT_TF_TREND", "4h")   # 趋势周期
-TF_ENTRY_1H = os.getenv("STRAT_TF_ENTRY_1H", "1h")
-TF_ENTRY_30M = os.getenv("STRAT_TF_ENTRY_30M", "30m")
-TF_ENTRY_15M = os.getenv("STRAT_TF_ENTRY_15M", "15m")
-
-# 策略模式：conservative / neutral / aggressive
-STRAT_MODE = os.getenv("STRAT_MODE", "neutral").lower()
-if STRAT_MODE not in {"conservative", "neutral", "aggressive"}:
-    STRAT_MODE = "neutral"
-
-# 单笔目标名义金额（USDT），和 main.py / Secrets 中 ORDER_USDT 保持一致
-TARGET_NOTIONAL_USDT = float(os.getenv("ORDER_USDT", "10"))
-
-# 杠杆档位：信号越强，用的杠杆越高，但不超过 MAX
-LEV_MIN = int(os.getenv("LEV_MIN", "3"))   # 弱信号
-LEV_MID = int(os.getenv("LEV_MID", "5"))   # 中等信号
-LEV_MAX = int(os.getenv("LEV_MAX", "8"))   # 强信号（建议别太大）
-
-# EMA 周期
-EMA_FAST_4H = 20
-EMA_SLOW_4H = 50
-EMA_ENTRY_1H = 20
-EMA_ENTRY_30M = 20
-EMA_ENTRY_15M = 20
+from typing import List, Dict, Any, Tuple, Optional
 
 
-# =============================
-# 工具函数
-# =============================
+# ---------- 工具函数：从 K 线提取收盘价 ----------
 
-def _ema(values: List[float], period: int) -> List[float]:
-    """简单 EMA 实现。"""
-    if not values or period <= 1:
-        return values[:]
+def extract_closes(klines: List[List[Any]]) -> List[float]:
+    """
+    默认按 OKX / Binance 标准 K 线格式：
+    [ts, open, high, low, close, volume, ...]
+    如果你的格式不同，可以在这里改。
+    """
+    closes: List[float] = []
+    for k in klines:
+        try:
+            closes.append(float(k[4]))
+        except (IndexError, TypeError, ValueError):
+            continue
+    return closes
 
-    alpha = 2 / (period + 1)
-    ema_vals: List[float] = [values[0]]
-    for v in values[1:]:
-        ema_vals.append(alpha * v + (1 - alpha) * ema_vals[-1])
+
+# ---------- 技术指标基础实现（不依赖第三方库） ----------
+
+def ema(series: List[float], period: int) -> List[float]:
+    if not series or period <= 0:
+        return []
+
+    k = 2 / (period + 1)
+    ema_vals: List[float] = []
+    ema_prev = series[0]
+    ema_vals.append(ema_prev)
+
+    for price in series[1:]:
+        ema_prev = price * k + ema_prev * (1 - k)
+        ema_vals.append(ema_prev)
+
     return ema_vals
 
 
-# ---------- 4h 趋势评估 ----------
-
-def _assess_trend_4h(closes: List[float]) -> Tuple[str, int, str]:
+def rsi(series: List[float], period: int) -> List[float]:
     """
-    用 4h EMA20 / EMA50 判断趋势方向 + 粗略强度评分。
-
-    返回:
-        trend: "up" / "down" / "none"
-        score: 0 / 1 / 2  （越大趋势越强）
-        desc: 文本描述
+    标准 Wilder RSI 实现。
+    返回与 series 等长的 RSI 列表，前 period 值用 None 填充。
     """
-    min_len = max(EMA_FAST_4H, EMA_SLOW_4H) + 5
-    if len(closes) < min_len:
-        return "none", 0, "4h K线数据不足"
+    n = len(series)
+    if n == 0 or period <= 0 or n < period + 1:
+        return []
 
-    ema_fast = _ema(closes, EMA_FAST_4H)
-    ema_slow = _ema(closes, EMA_SLOW_4H)
+    deltas = [series[i] - series[i - 1] for i in range(1, n)]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
 
-    # 用上一根收盘 K（已收线）
-    idx = -2
-    last_fast = ema_fast[idx]
-    last_slow = ema_slow[idx]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    if last_fast > last_slow:
-        trend = "up"
-    elif last_fast < last_slow:
-        trend = "down"
+    rsi_vals: List[Optional[float]] = [None] * (period + 1)  # 前 period+1 个位置对齐
+    if avg_loss == 0:
+        rsi_vals[-1] = 100.0
     else:
-        return "none", 0, "4h EMA20 与 EMA50 几乎重合，无趋势"
+        rs = avg_gain / avg_loss
+        rsi_vals[-1] = 100 - (100 / (1 + rs))
 
-    # 趋势强度：快慢线乖离百分比
-    if last_slow != 0:
-        diff_pct = abs(last_fast - last_slow) / abs(last_slow) * 100
-    else:
-        diff_pct = 0.0
+    for i in range(period, len(deltas)):
+        gain = gains[i]
+        loss = losses[i]
 
-    # 评分：0 / 1 / 2（略微放宽一点）
-    if diff_pct < 0.15:
-        score = 0          # 几乎缠绕，趋势很弱
-    elif diff_pct < 0.6:
-        score = 1          # 普通趋势
-    else:
-        score = 2          # 趋势比较明显
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
 
-    desc = f"{TF_TREND} EMA20/50 趋势：{'多头' if trend == 'up' else '空头'}，乖离约 {diff_pct:.2f}%，score={score}"
-    return trend, score, desc
+        if avg_loss == 0:
+            rsi_vals.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi_vals.append(100 - (100 / (1 + rs)))
+
+    # 对齐长度
+    while len(rsi_vals) < n:
+        rsi_vals.insert(0, None)
+
+    return rsi_vals[:n]
 
 
-# ---------- 单一周期入场评分 ----------
+# ---------- ① 基础信号层：双均线交叉 ----------
 
-def _entry_score_single_tf(
+def base_signal_from_ma(
     closes: List[float],
-    trend: str,
-    period: int,
-    tf_name: str,
-) -> Tuple[int, str]:
+    fast: int,
+    slow: int,
+    sig: int,  # 目前暂时没用到信号线，可以为以后扩展预留
+) -> int:
     """
-    给单一周期打入场分：
+    返回原始信号 raw_signal ∈ {-1, 0, 1}
+    逻辑：双均线“金叉/死叉”给出一次性信号（避免每根K线都重复开仓）
 
-    - 只做顺势方向（4h 多头 -> 只考虑多；4h 空头 -> 只考虑空）
-    - 评分规则：
-        * 从反向一侧穿到趋势一侧：2 分（强信号）
-        * 已经在趋势一侧并保持：1 分（普通信号）
-        * 其余：0 分（反向或无信号）
-
-    返回:
-        score: 0 / 1 / 2
-        desc: 文本描述
+    - fast 从下向上穿 slow：+1（看多）
+    - fast 从上向下穿 slow：-1（看空）
+    - 其他情况：0（不发新信号）
     """
-    min_len = period + 3
-    if len(closes) < min_len or trend == "none":
-        return 0, f"{tf_name} K线数据不足或无趋势"
+    if len(closes) < slow + 2:
+        return 0
 
-    ema_vals = _ema(closes, period)
+    fast_ema = ema(closes, fast)
+    slow_ema = ema(closes, slow)
 
-    idx = -2
-    prev_idx = -3
+    # 只看最后两根，用于判断是否发生了“穿越”
+    fast_prev, fast_last = fast_ema[-2], fast_ema[-1]
+    slow_prev, slow_last = slow_ema[-2], slow_ema[-1]
 
-    prev_close = closes[prev_idx]
-    last_close = closes[idx]
-    prev_ema = ema_vals[prev_idx]
-    last_ema = ema_vals[idx]
+    prev_diff = fast_prev - slow_prev
+    last_diff = fast_last - slow_last
 
-    side_text = "多" if trend == "up" else "空"
+    # 金叉：由下到上
+    if prev_diff <= 0 and last_diff > 0:
+        return 1
 
-    # 趋势方向：多头 -> 希望价格在 EMA 上方；空头 -> 希望价格在 EMA 下方
-    if trend == "up":
-        # 从下向上穿越 -> 2 分
-        if prev_close <= prev_ema and last_close > last_ema:
-            return 2, f"{tf_name} 收盘价向上穿越 EMA{period}，顺势{side_text}强信号(+2)"
-        # 一直站在 EMA 上方 -> 1 分
-        elif last_close > last_ema:
-            return 1, f"{tf_name} 收盘价位于 EMA{period} 上方，顺势{side_text}普通信号(+1)"
-        else:
-            return 0, f"{tf_name} 收盘价在 EMA{period} 下方，逆势/无信号(+0)"
+    # 死叉：由上到下
+    if prev_diff >= 0 and last_diff < 0:
+        return -1
 
-    else:  # trend == "down"
-        # 从上向下穿越 -> 2 分
-        if prev_close >= prev_ema and last_close < last_ema:
-            return 2, f"{tf_name} 收盘价向下穿越 EMA{period}，顺势{side_text}强信号(+2)"
-        # 一直在 EMA 下方 -> 1 分
-        elif last_close < last_ema:
-            return 1, f"{tf_name} 收盘价位于 EMA{period} 下方，顺势{side_text}普通信号(+1)"
-        else:
-            return 0, f"{tf_name} 收盘价在 EMA{period} 上方，逆势/无信号(+0)"
+    return 0
 
 
-# ---------- 多周期合成入场信号 ----------
+# ---------- ② 过滤层：趋势 / RSI / 暴跌 ----------
 
-def _entry_signal_multi_tf(
-    closes_1h: List[float],
-    closes_30m: List[float],
-    closes_15m: List[float],
-    trend: str,
-) -> Tuple[str, int, str]:
+def detect_htf_trend(
+    htf_closes: List[float],
+    ma_period: int,
+) -> str:
     """
-    综合 1h + 30m + 15m 得到入场方向和得分。
-
-    direction:
-        "long" / "short" / "none"
-    score:
-        0~6
-    desc:
-        用于 reason 的文本描述
+    高周期趋势判断：
+    - last_close > MA → "up"
+    - last_close < MA → "down"
+    - 否则 → "flat"
     """
-    if trend == "none":
-        return "none", 0, "无 4h 趋势，不考虑入场"
+    if not htf_closes or len(htf_closes) < ma_period:
+        return "unknown"
 
-    # 单周期评分
-    score_1h, desc_1h = _entry_score_single_tf(
-        closes_1h, trend, EMA_ENTRY_1H, TF_ENTRY_1H
-    )
-    score_30m, desc_30m = _entry_score_single_tf(
-        closes_30m, trend, EMA_ENTRY_30M, TF_ENTRY_30M
-    )
-    score_15m, desc_15m = _entry_score_single_tf(
-        closes_15m, trend, EMA_ENTRY_15M, TF_ENTRY_15M
-    )
+    ma_vals = ema(htf_closes, ma_period)
+    last_close = htf_closes[-1]
+    last_ma = ma_vals[-1]
 
-    total_score = score_1h + score_30m + score_15m
-
-    # 不同模式的入场门槛
-    if STRAT_MODE == "conservative":
-        threshold = 3
-    elif STRAT_MODE == "aggressive":
-        threshold = 1
-    else:  # neutral
-        threshold = 2
-
-    if total_score < threshold:
-        desc = (
-            f"{TF_ENTRY_1H}/{TF_ENTRY_30M}/{TF_ENTRY_15M} 顺势评分总分={total_score}，"
-            f"未达到模式({STRAT_MODE})入场阈值={threshold}\n"
-            f"- {desc_1h}\n- {desc_30m}\n- {desc_15m}"
-        )
-        return "none", total_score, desc
-
-    direction = "long" if trend == "up" else "short"
-    desc = (
-        f"多周期顺势评分总分={total_score} (mode={STRAT_MODE}, 阈值={threshold})，"
-        f"方向={direction}\n"
-        f"- {desc_1h}\n- {desc_30m}\n- {desc_15m}"
-    )
-    return direction, total_score, desc
-
-
-# ---------- 信号强度 -> 杠杆 ----------
-
-def _choose_leverage(trend_score: int, entry_score: int) -> int:
-    """
-    趋势 + 入场评分总分越高，用的杠杆越大，但不超过 LEV_MAX。
-    简化映射：
-        total <= 2   -> LEV_MIN
-        3 <= total <= 4 -> LEV_MID
-        total >= 5   -> LEV_MAX
-    """
-    total = trend_score + entry_score
-
-    if total <= 2:
-        return LEV_MIN
-    elif total <= 4:
-        return LEV_MID
+    if last_close > last_ma:
+        return "up"
+    elif last_close < last_ma:
+        return "down"
     else:
-        return LEV_MAX
+        return "flat"
 
 
-# ---------- 构造订单（带最小下单单位） ----------
+def detect_crash(
+    closes: List[float],
+    lookback: int,
+    threshold: float,
+) -> bool:
+    """
+    暴跌检测：
+    - 最近 lookback 根K线的整体跌幅 <= threshold（如 -0.03）
+    """
+    if len(closes) < lookback + 1 or lookback <= 0:
+        return False
 
-def _build_futures_order(
-    trader: Trader,
+    last = closes[-1]
+    prev = closes[-1 - lookback]
+
+    pct_change = (last - prev) / prev
+    return pct_change <= threshold
+
+
+def apply_filters(
+    raw_signal: int,
+    closes: List[float],
+    htf_closes: Optional[List[float]],
+    cfg_filters: Dict[str, Any],
+    debug_info: Dict[str, Any],
+) -> int:
+    """
+    过滤逻辑：
+    - 高周期趋势：
+        * 趋势向下时禁止做多
+        * 趋势向上时禁止做空
+    - RSI 过滤：
+        * RSI > long_overbought → 禁止做多（避免追高）
+        * RSI < short_oversold → 禁止做空（避免抄底抄到半山腰）
+    - 暴跌过滤：
+        * 近期跌幅超过 crash_threshold 时，禁止做多，只保留做空信号
+    """
+
+    # 默认返回原始信号
+    final_signal = raw_signal
+
+    # --- 1）高周期趋势过滤 ---
+    htf_trend = "unknown"
+    htf_period = int(cfg_filters.get("htf_ma_period", 50))
+    if htf_closes:
+        htf_trend = detect_htf_trend(htf_closes, htf_period)
+
+    debug_info["htf_trend"] = htf_trend
+
+    if final_signal == 1 and htf_trend == "down":
+        debug_info["blocked_by_htf_trend"] = "long_blocked_in_downtrend"
+        final_signal = 0
+    elif final_signal == -1 and htf_trend == "up":
+        debug_info["blocked_by_htf_trend"] = "short_blocked_in_uptrend"
+        final_signal = 0
+
+    # --- 2）RSI 过滤 ---
+    rsi_period = int(cfg_filters.get("rsi_period", 14))
+    rsi_vals = rsi(closes, rsi_period)
+    last_rsi = rsi_vals[-1] if rsi_vals else None
+    debug_info["rsi"] = last_rsi
+
+    long_overbought = float(cfg_filters.get("rsi_long_overbought", 70))
+    short_oversold = float(cfg_filters.get("rsi_short_oversold", 30))
+
+    if last_rsi is not None:
+        if final_signal == 1 and last_rsi >= long_overbought:
+            debug_info["blocked_by_rsi"] = "long_blocked_overbought"
+            final_signal = 0
+        elif final_signal == -1 and last_rsi <= short_oversold:
+            debug_info["blocked_by_rsi"] = "short_blocked_oversold"
+            final_signal = 0
+
+    # --- 3）暴跌过滤 ---
+    crash_lookback = int(cfg_filters.get("crash_lookback", 4))
+    crash_threshold = float(cfg_filters.get("crash_threshold", -0.03))
+    crashed = detect_crash(closes, crash_lookback, crash_threshold)
+    debug_info["crashed"] = crashed
+
+    if crashed and final_signal == 1:
+        # 暴跌后禁止立即做多，只允许做空或观望
+        debug_info["blocked_by_crash"] = "long_blocked_after_crash"
+        final_signal = 0
+
+    return final_signal
+
+
+# ---------- 对外主函数：生成信号 ----------
+
+def generate_signal(
     symbol: str,
-    direction: str,
-    ref_price: float,
-    lev: int,
-    trend_desc: str,
-    entry_desc: str,
-) -> OrderRequest:
-    """根据方向 + 杠杆 + 参考价格构造 OrderRequest。"""
-    if ref_price <= 0:
-        amount = 0.001
-    else:
-        amount = TARGET_NOTIONAL_USDT / ref_price
+    klines: List[List[Any]],
+    cfg: Dict[str, Any],
+    htf_klines: Optional[List[List[Any]]] = None,
+    debug: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    主入口：
 
-    # 这里加入最小下单单位自动补足逻辑
-    min_qty = MIN_QTY.get(symbol, 0.0)
-    if amount < min_qty:
-        print(
-            f"[strategy] {symbol} 计算得到的数量 {amount:.6f} 小于最小下单单位 {min_qty}, "
-            f"自动提升到 {min_qty}。"
-        )
-        amount = min_qty
+    参数：
+        symbol     : 交易对，例如 "BTCUSDT"
+        klines     : 当前周期 K 线（如 1h），列表形式
+        cfg        : 完整配置（包含 logic / filters 等）
+        htf_klines : 高周期 K 线（如 4h），可选
+        debug      : True 时会在 debug_info 里写入更多细节
 
-    if direction == "long":
-        side = Side.BUY
-        pos_side = PositionSide.LONG
-    else:
-        side = Side.SELL
-        pos_side = PositionSide.SHORT
+    返回：
+        (signal, debug_info)
+        signal ∈ {-1, 0, 1}:
+            1  -> 做多
+            -1 -> 做空
+            0  -> 不下单
+    """
+    debug_info: Dict[str, Any] = {"symbol": symbol}
 
-    reason = (
-        f"{trend_desc}\n"
-        f"{entry_desc}\n"
-        f"动态杠杆: {lev}x, 参考价: {ref_price:.4f}, 目标名义金额≈{TARGET_NOTIONAL_USDT} USDT "
-        f"(实际数量已不低于最小单位 {min_qty})"
+    closes = extract_closes(klines)
+    if len(closes) < 10:
+        debug_info["reason"] = "not_enough_data"
+        return 0, debug_info
+
+    logic = cfg.get("logic", {})
+    filters_cfg = cfg.get("filters", {})
+
+    fast = int(logic.get("fast", 12))
+    slow = int(logic.get("slow", 26))
+    sig = int(logic.get("sig", 9))
+
+    # ① 基础信号层
+    raw_signal = base_signal_from_ma(closes, fast, slow, sig)
+    debug_info["raw_signal"] = raw_signal
+    debug_info["fast"] = fast
+    debug_info["slow"] = slow
+    debug_info["sig"] = sig
+
+    if raw_signal == 0:
+        # 没有新金叉/死叉信号，直接退出（也可以选择进入过滤层再看）
+        return 0, debug_info
+
+    # ② 过滤层
+    htf_closes = extract_closes(htf_klines) if htf_klines else None
+    final_signal = apply_filters(
+        raw_signal=raw_signal,
+        closes=closes,
+        htf_closes=htf_closes,
+        cfg_filters=filters_cfg,
+        debug_info=debug_info,
     )
 
-    return OrderRequest(
-        env=trader.env,
-        market=MarketType.FUTURES,
-        symbol=symbol,
-        side=side,
-        amount=amount,
-        leverage=lev,
-        position_side=pos_side,
-        reduce_only=False,
-        reason=reason,
-    )
+    debug_info["final_signal"] = final_signal
 
+    if debug:
+        print(f"[DEBUG][strategy] {symbol} -> raw={raw_signal}, final={final_signal}, info={debug_info}")
 
-# =============================
-# 主策略入口
-# =============================
-
-def generate_orders(trader: Trader) -> List[OrderRequest]:
-    """
-    策略主入口（被 main.py 调用）：
-
-    - 4h K 线：评估趋势方向 + 强度（决定多 / 空 / 不交易 + 部分分数）
-    - 1h + 30m + 15m：多周期顺势评估，得到入场方向 + 强度分数
-    - 根据 总分 -> 选择杠杆档位（LEV_MIN / MID / MAX）
-    - 构造订单时保证数量 ≥ OKX 最小下单单位
-    """
-    orders: List[OrderRequest] = []
-
-    fut = trader.futures
-
-    for symbol in FUTURE_SYMBOLS:
-        try:
-            # 4h 趋势数据
-            ohlcv_4h = fut.fetch_ohlcv(symbol, timeframe=TF_TREND, limit=120)
-            if not ohlcv_4h or len(ohlcv_4h) < 80:
-                print(f"[strategy] {symbol} 4h K线数据不足，跳过。")
-                continue
-
-            closes_4h = [c[4] for c in ohlcv_4h]
-            trend, trend_score, trend_desc = _assess_trend_4h(closes_4h)
-            if trend == "none":
-                print(f"[strategy] {symbol} {trend_desc}，跳过。")
-                continue
-
-            # 1h / 30m / 15m 入场数据
-            ohlcv_1h = fut.fetch_ohlcv(symbol, timeframe=TF_ENTRY_1H, limit=200)
-            ohlcv_30m = fut.fetch_ohlcv(symbol, timeframe=TF_ENTRY_30M, limit=200)
-            ohlcv_15m = fut.fetch_ohlcv(symbol, timeframe=TF_ENTRY_15M, limit=200)
-
-            if not ohlcv_1h or len(ohlcv_1h) < 80:
-                print(f"[strategy] {symbol} 1h K线数据不足，跳过。")
-                continue
-
-            closes_1h = [c[4] for c in ohlcv_1h]
-            closes_30m = [c[4] for c in ohlcv_30m] if ohlcv_30m else []
-            closes_15m = [c[4] for c in ohlcv_15m] if ohlcv_15m else []
-
-            direction, entry_score, entry_desc = _entry_signal_multi_tf(
-                closes_1h, closes_30m, closes_15m, trend
-            )
-
-            if direction == "none":
-                print(
-                    f"[strategy] {symbol} 有 4h 趋势但多周期顺势得分过低："
-                    f"trend_score={trend_score}, entry_score={entry_score}。"
-                )
-                continue
-
-            # 杠杆
-            lev = _choose_leverage(trend_score, entry_score)
-
-            # 参考价格：用 1h 上一根收盘价
-            ref_price = closes_1h[-2]
-
-            order = _build_futures_order(
-                trader=trader,
-                symbol=symbol,
-                direction=direction,
-                ref_price=ref_price,
-                lev=lev,
-                trend_desc=trend_desc,
-                entry_desc=entry_desc,
-            )
-            orders.append(order)
-
-            print(
-                f"[strategy] 生成 {symbol} 信号: dir={direction}, lev={lev}x, "
-                f"ref_price={ref_price:.4f}, amount~{order.amount:.6f}, "
-                f"trend_score={trend_score}, entry_score={entry_score}, mode={STRAT_MODE}"
-            )
-
-        except Exception as e:
-            print(f"[strategy] 处理 {symbol} 时出错: {e}")
-            continue
-
-    return orders
+    return final_signal, debug_info
