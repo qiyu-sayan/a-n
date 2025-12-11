@@ -1,363 +1,156 @@
-# bot/main.py
-from __future__ import annotations
+"""
+main.py
 
-import csv
-import os
-from datetime import datetime
-from typing import List, Tuple, Optional
+职责：
+- 读取配置
+- 为每个交易对获取 K 线数据
+- 调用 strategy.generate_signal 生成信号
+- 调用 OKXTrader 在 OKX 上开仓 / 平仓
 
-import ccxt
+运行方式：
+    python -m bot.main
+由 GitHub Actions 的 run-bot workflow 定时触发。
+"""
 
-from bot.strategy import generate_orders
-from bot.wecom_notify import send_wecom_markdown
-from bot.trader import (
-    Trader,
-    OrderRequest,
-    MarketType,
-)
-from bot.virtual_pnl import VirtualPositionManager, ClosedTrade
+import time
+from typing import Dict, Any, List, Tuple
 
+import requests
 
-# =============================
-# 环境定义
-# =============================
-
-class Env:
-    TEST = "test"
-    LIVE = "live"
+from bot.trader import OKXTrader, load_config
+from bot.strategy import generate_signal
 
 
-def now_ts() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-
-# =============================
-# 名义金额估算
-# =============================
-
-def _estimate_notional(ex: ccxt.Exchange, market: MarketType, symbol: str, amount: float) -> float:
+def symbol_to_inst_id(symbol: str) -> str:
     """
-    尝试预估名义金额 = amount * 最新价格。
+    把 BTCUSDT -> BTC-USDT-SWAP
+       ETHUSDT -> ETH-USDT-SWAP
     """
-    try:
-        ticker = ex.fetch_ticker(symbol)
-        price: Optional[float] = (
-            ticker.get("last")
-            or ticker.get("close")
-            or ticker.get("ask")
-            or ticker.get("bid")
-        )
-
-        if price is None:
-            m = ex.market(symbol)
-            info = m.get("info", {})
-            price = info.get("last") or info.get("idxPx") or info.get("markPx")
-
-        if price is None:
-            return 0.0
-
-        return abs(float(amount)) * float(price)
-
-    except Exception:
-        return 0.0
-
-
-# =============================
-# 风控参数
-# =============================
-
-ORDER_USDT = float(os.getenv("ORDER_USDT", "10"))
-
-MAX_ORDERS_PER_RUN = 3
-MAX_FUTURES_NOTIONAL_LIVE = 50_000
-LIVE_RISK_PER_TRADE = 0.05
-
-MAX_FUTURES_NOTIONAL_TEST = ORDER_USDT
-
-
-# =============================
-# 创建 OKX 客户端
-# =============================
-
-def create_okx_exchanges(env: str) -> Tuple[ccxt.Exchange, ccxt.Exchange]:
-    if env == Env.TEST:
-        api_key = os.getenv("OKX_PAPER_API_KEY")
-        api_secret = os.getenv("OKX_PAPER_API_SECRET")
-        api_passphrase = os.getenv("OKX_PAPER_API_PASSPHRASE")
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
     else:
-        api_key = os.getenv("OKX_LIVE_API_KEY")
-        api_secret = os.getenv("OKX_LIVE_API_SECRET")
-        api_passphrase = os.getenv("OKX_LIVE_API_PASSPHRASE")
+        base = symbol
+    return f"{base}-USDT-SWAP"
 
-    base_config = {
-        "apiKey": api_key,
-        "secret": api_secret,
-        "password": api_passphrase,
-        "enableRateLimit": True,
+
+def fetch_klines(
+    base_url: str,
+    inst_id: str,
+    bar: str,
+    limit: int = 200,
+) -> List[List[Any]]:
+    """
+    从 OKX 公共接口获取 K 线数据。
+    返回按时间从旧 -> 新排序的列表。
+    """
+    url = base_url + "/api/v5/market/candles"
+    params = {
+        "instId": inst_id,
+        "bar": bar,
+        "limit": str(limit),
     }
+    resp = requests.get(url, params=params, timeout=10)
+    data = resp.json()
+    if data.get("code") != "0":
+        raise RuntimeError(f"fetch_klines error: {data}")
+    klines = data.get("data", [])
+    # OKX 返回是最新在前，这里反转一下方便做指标
+    klines.reverse()
+    return klines
 
-    spot_ex = ccxt.okx({**base_config, "options": {"defaultType": "spot"}})
-    fut_ex = ccxt.okx({**base_config, "options": {"defaultType": "swap", "defaultSettle": "usdt"}})
 
-    if env == Env.TEST:
-        spot_ex.set_sandbox_mode(True)
-        fut_ex.set_sandbox_mode(True)
-
-    return spot_ex, fut_ex
-
-
-# =============================
-# 风控逻辑
-# =============================
-
-def _apply_risk_controls(
-    env: str,
-    spot_ex: ccxt.Exchange,
-    fut_ex: ccxt.Exchange,
-    orders: List[OrderRequest],
-) -> List[Tuple[OrderRequest, float]]:
+def interval_to_bar(interval: str) -> str:
     """
-    返回：[(订单, 预估名义金额)]
-
-    TEST（模拟盘）：
-        - 不缩小数量，只估算名义金额供观测使用
-    LIVE（实盘）：
-        - 按余额 + 风险比例裁剪（预留）
+    把配置里的 interval 映射成 OKX 的 bar 参数。
+    例如：
+        "1h" -> "1H"
+        "4h" -> "4H"
+        "15m" -> "15m"
     """
-    adjusted: List[Tuple[OrderRequest, float]] = []
+    if not interval:
+        return "1H"
+    # 简单粗暴：h 变大写 H，其他保持不动
+    return interval.replace("h", "H")
 
-    live_total_usdt = 0.0
-    live_free_usdt = 0.0
 
-    if env == Env.LIVE:
+def run_once(cfg: Dict[str, Any]) -> None:
+    """
+    跑一轮：对每个 symbol 做一次信号判断和下单。
+    由 GitHub Actions 定时唤醒，所以这里只跑一轮即可。
+    """
+    trader = OKXTrader(cfg, use_demo=True)  # 现在先默认模拟盘
+
+    base_url = trader.base_url  # https://www.okx.com 或模拟盘地址
+    symbols = cfg.get("symbols", ["BTCUSDT", "ETHUSDT"])
+    interval = cfg.get("interval", "1h")
+    bar = interval_to_bar(interval)
+
+    # 高周期（趋势）用 4h，可以以后做成配置
+    htf_bar = "4H"
+
+    print(f"Running bot once, interval={interval}, bar={bar}, htf_bar={htf_bar}")
+    for symbol in symbols:
+        inst_id = symbol_to_inst_id(symbol)
+        print(f"\n=== {symbol} / {inst_id} ===")
+
         try:
-            bal = spot_ex.fetch_balance(params={"type": "trade"})
-            usdt = bal.get("USDT") or bal.get("usdt") or {}
-            live_total_usdt = float(usdt.get("total") or 0.0)
-            live_free_usdt = float(usdt.get("free") or 0.0)
-            print(f"[main] 实盘余额: total={live_total_usdt}, free={live_free_usdt}")
+            klines = fetch_klines(base_url, inst_id, bar, limit=200)
+            htf_klines = fetch_klines(base_url, inst_id, htf_bar, limit=200)
         except Exception as e:
-            print(f"[main] 获取余额失败: {e}")
-            return []
-
-    count = 0
-
-    for req in orders:
-        if count >= MAX_ORDERS_PER_RUN:
-            print("[risk] 超出每轮最大下单数，忽略剩余信号。")
-            break
-
-        ex = fut_ex if req.market == MarketType.FUTURES else spot_ex
-        notional = _estimate_notional(ex, req.market, req.symbol, req.amount)
-
-        if env == Env.TEST:
-            if notional <= 0:
-                notional = MAX_FUTURES_NOTIONAL_TEST
-                print(f"[risk] DEMO 无法预估名义金额，使用默认 ORDER_USDT={notional}。")
-            else:
-                print(
-                    f"[risk] DEMO 预估名义金额: symbol={req.symbol}, "
-                    f"amount={req.amount:.6f}, notional≈{notional:.4f} USDT"
-                )
-            adjusted.append((req, notional))
-            count += 1
+            print(f"[ERROR] fetch_klines failed for {inst_id}: {e}")
             continue
 
-        # LIVE：严格裁剪（以后上实盘再用）
-        if notional <= 0:
-            print(f"[risk] LIVE 无法预估名义金额，跳过订单。")
+        signal, info = generate_signal(
+            symbol=symbol,
+            klines=klines,
+            cfg=cfg,
+            htf_klines=htf_klines,
+            debug=True,
+        )
+
+        print(f"[INFO] signal for {symbol}: {signal}, info: {info}")
+
+        # 不发新信号就跳过
+        if signal == 0:
             continue
 
-        abs_cap = MAX_FUTURES_NOTIONAL_LIVE
-        dyn_cap = live_total_usdt * LIVE_RISK_PER_TRADE
-        cap = min(abs_cap, dyn_cap, live_free_usdt)
+        # 下单前先获取一眼价格，仅用于日志（真正下单时 trader 会自己取最新价）
+        try:
+            last = trader.get_last_price(inst_id)
+        except Exception:
+            last = None
+        print(f"[INFO] last price {inst_id} = {last}")
 
-        if cap <= 0:
-            print("[risk] LIVE 可用余额不足，放弃全部下单。")
-            return []
+        # 简单的“净仓”风格：
+        # - 做多信号：先平空，再开多
+        # - 做空信号：先平多，再开空
+        try:
+            if signal == 1:
+                print("[ACTION] close_short then open_long")
+                try:
+                    trader.close_short(inst_id)
+                except Exception as e:
+                    print(f"[WARN] close_short failed (maybe no short position): {e}")
+                trader.open_long(inst_id, ref_price=last)
 
-        if notional > cap:
-            scale = cap / notional
-            old_amount = req.amount
-            req.amount *= scale
-            notional = cap
-            print(
-                f"[risk] LIVE 名义金额超上限 → 调仓 {old_amount:.6f} → {req.amount:.6f}"
-            )
+            elif signal == -1:
+                print("[ACTION] close_long then open_short")
+                try:
+                    trader.close_long(inst_id)
+                except Exception as e:
+                    print(f"[WARN] close_long failed (maybe no long position): {e}")
+                trader.open_short(inst_id, ref_price=last)
 
-        adjusted.append((req, notional))
-        count += 1
+        except Exception as e:
+            print(f"[ERROR] trade action failed for {inst_id}: {e}")
 
-    return adjusted
+        # 给接口留一点喘息时间
+        time.sleep(0.5)
 
-
-def _log_trade(req: OrderRequest, result: dict, env: str, notional: float):
-    path = f"logs/trades_{env}.csv"
-    exists = os.path.exists(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    with open(path, "a", newline="", encoding="utf8") as f:
-        w = csv.writer(f)
-        if not exists:
-            w.writerow(
-                [
-                    "ts",
-                    "symbol",
-                    "side",
-                    "position_side",
-                    "amount",
-                    "notional",
-                    "lev",
-                    "order_id",
-                    "reason",
-                ]
-            )
-        w.writerow(
-            [
-                now_ts(),
-                req.symbol,
-                req.side.value,
-                req.position_side.value if req.position_side else "",
-                req.amount,
-                notional,
-                req.leverage,
-                result.get("order_id", ""),
-                (req.reason or "").replace("\n", " | "),
-            ]
-        )
-
-
-def _get_fill_price(ex: ccxt.Exchange, symbol: str) -> Optional[float]:
-    """尽量获取当前成交价，用于虚拟开平仓。"""
-    try:
-        t = ex.fetch_ticker(symbol)
-        price = (
-            t.get("last")
-            or t.get("close")
-            or t.get("ask")
-            or t.get("bid")
-        )
-        if price:
-            return float(price)
-    except Exception:
-        pass
-    return None
-
-
-# =============================
-# 主流程（单轮运行）
-# =============================
-
-def run_once(env: str):
-    print(f"[main] 运行环境: {env}")
-    if env == Env.TEST:
-        print("Notice: 当前为 DEMO 模拟盘环境，用于调试策略与风控逻辑，请勿视为实盘。")
-
-    spot_ex, fut_ex = create_okx_exchanges(env)
-    trader = Trader(env, spot_ex, fut_ex)
-    vp_manager = VirtualPositionManager(env)
-
-    raw_orders = generate_orders(trader)
-    if not raw_orders:
-        print("[main] 本次无交易信号。")
-        return
-
-    adjusted = _apply_risk_controls(env, spot_ex, fut_ex, raw_orders)
-    if not adjusted:
-        print("[main] 风控后无有效订单，退出。")
-        return
-
-    print(f"[main] 策略生成 {len(adjusted)} 个订单。")
-
-    wecom_msgs: List[str] = []
-    success_count = 0
-    closed_trades: List[ClosedTrade] = []
-
-    for req, notional in adjusted:
-        print(
-            f"[main] 下单请求: {req.symbol} {req.side.value} "
-            f"amount={req.amount}, lev={req.leverage}"
-        )
-
-        ok, result = trader.place_order(req)
-
-        closed: Optional[ClosedTrade] = None
-        if ok:
-            try:
-                ex = fut_ex if req.market == MarketType.FUTURES else spot_ex
-                fill_price = _get_fill_price(ex, req.symbol)
-                if fill_price is not None and req.market == MarketType.FUTURES:
-                    closed = vp_manager.on_order_filled(req, fill_price)
-                    if closed:
-                        closed_trades.append(closed)
-            except Exception as e:
-                print(f"[virtual] 处理虚拟持仓时出错: {e}")
-
-        if ok:
-            success_count += 1
-            order_id = result.get("order_id", "")
-            msg = (
-                f"【成功】{req.symbol} {req.side.value} x{req.leverage}\n"
-                f"数量: {req.amount}, notional≈{notional:.2f}\n"
-                f"信号:\n{req.reason}"
-            )
-            if closed:
-                pnl_flag = "✅" if closed.pnl > 0 else "❌"
-                msg += (
-                    f"\n\n【虚拟平仓】方向: {closed.side.value}, 数量: {closed.qty}\n"
-                    f"开仓价: {closed.entry_price:.4f}, 平仓价: {closed.exit_price:.4f}\n"
-                    f"PNL≈{closed.pnl:.4f} USDT {pnl_flag}"
-                )
-            wecom_msgs.append(msg)
-            _log_trade(req, result, env, notional)
-        else:
-            msg = (
-                f"【失败】{req.symbol} {req.side.value}\n"
-                f"错误: {result.get('error')}\n"
-                f"信号:\n{req.reason}"
-            )
-            wecom_msgs.append(msg)
-
-        print("[main] 下单结果:", ok, result)
-
-    if closed_trades:
-        wins = sum(1 for t in closed_trades if t.pnl > 0)
-        total = len(closed_trades)
-        total_pnl = sum(t.pnl for t in closed_trades)
-        summary = (
-            f"本轮虚拟平仓 {total} 笔，胜率 {wins}/{total}"
-            f" ({wins / total:.2%})，合计 PNL≈{total_pnl:.4f} USDT"
-        )
-        wecom_msgs.append(summary)
-        print("[virtual] " + summary)
-
-    if wecom_msgs:
-        text = "### 交易机器人执行结果 - DEMO (OKX 模拟盘)\n\n" + "\n\n".join(wecom_msgs)
-        send_wecom_markdown(text)
-
-    print(f"[main] 本轮完成：成功 {success_count} / {len(adjusted)}")
-
-
-# =============================
-# 入口：加上错误告警
-# =============================
 
 def main():
-    env = os.getenv("BOT_ENV", Env.TEST)
-    try:
-        run_once(env)
-    except Exception as e:
-        import traceback
-        err = traceback.format_exc()
-        print("[main] 运行异常:", err)
-        # 尝试用企业微信报警
-        try:
-            msg = f"【机器人异常】环境: {env}\n\n```\n{err[-1500:]}\n```"
-            send_wecom_markdown(msg)
-        except Exception as e2:
-            print("[WeCom] 发送异常通知失败:", e2)
-        # 继续抛出，让 GitHub Actions 标红
-        raise
+    cfg = load_config()
+    run_once(cfg)
 
 
 if __name__ == "__main__":
