@@ -6,6 +6,7 @@ main.py
 - 为每个交易对获取 K 线数据
 - 调用 strategy.generate_signal 生成信号
 - 调用 OKXTrader 在 OKX 上开仓 / 平仓
+- 有实际开新仓时，通过企业微信推送一条消息
 
 运行方式：
     python -m bot.main
@@ -13,15 +14,16 @@ main.py
 """
 
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 import requests
 
 from bot.trader import OKXTrader, load_config
 from bot.strategy import generate_signal
-# 尝试导入企业微信推送函数，如果没有就静默忽略
+
+# 企业微信推送
 try:
-    from wecom_notify import send_wecom_text  # 如果你以前的函数名不是这个，下面我会给兼容写法
+    from wecom_notify import send_wecom_text
 except Exception:
     send_wecom_text = None
 
@@ -90,6 +92,7 @@ def run_once(cfg: Dict[str, Any]) -> None:
         inst_id = symbol_to_inst_id(symbol)
         print(f"\n=== {symbol} / {inst_id} ===")
 
+        # 1. 获取 K 线
         try:
             klines = fetch_klines(base_url, inst_id, bar, limit=200)
             htf_klines = fetch_klines(base_url, inst_id, htf_bar, limit=200)
@@ -97,6 +100,7 @@ def run_once(cfg: Dict[str, Any]) -> None:
             print(f"[ERROR] fetch_klines failed for {inst_id}: {e}")
             continue
 
+        # 2. 生成信号
         signal, info = generate_signal(
             symbol=symbol,
             klines=klines,
@@ -108,9 +112,10 @@ def run_once(cfg: Dict[str, Any]) -> None:
         print(f"[INFO] signal for {symbol}: {signal}, info: {info}")
 
         if signal == 0:
+            # 没有可执行信号
             continue
 
-        # 当前仓位情况
+        # 3. 查询当前仓位
         has_long = False
         has_short = False
         try:
@@ -129,21 +134,24 @@ def run_once(cfg: Dict[str, Any]) -> None:
         except Exception as e:
             print(f"[WARN] get_positions failed for {inst_id}: {e}")
 
-        # 仅当 signal 与当前持仓方向“不一致”时才动作
+        # 4. 最新价格（用于日志 & 推送）
         try:
             last = trader.get_last_price(inst_id)
         except Exception:
             last = None
-                print(f"[INFO] last price {inst_id} = {last}")
+        print(f"[INFO] last price {inst_id} = {last}")
 
+        # 5. 根据信号 + 当前仓位执行操作，并在真正开新仓时推送企业微信
         try:
             if signal == 1:
+                # 做多信号
                 if has_long:
                     print("[ACTION] already long, no new long opened")
                 else:
-                    action_desc = "close_short_then_open_long" if has_short else "open_long"
+                    action_desc = "open_long"
                     if has_short:
                         print("[ACTION] close_short then open_long")
+                        action_desc = "close_short_then_open_long"
                         try:
                             trader.close_short(inst_id)
                         except Exception as e:
@@ -153,13 +161,13 @@ def run_once(cfg: Dict[str, Any]) -> None:
 
                     trader.open_long(inst_id, ref_price=last)
 
-                    # === 企业微信推送（做多开仓成功后） ===
+                    # WeCom 推送
                     if send_wecom_text is not None:
                         msg = (
                             f"[开多] {symbol} / {inst_id}\n"
                             f"价格: {last}\n"
-                            f"信号: {info}\n"
-                            f"动作: {action_desc}"
+                            f"动作: {action_desc}\n"
+                            f"信号详情: {info}"
                         )
                         try:
                             send_wecom_text(msg)
@@ -167,12 +175,14 @@ def run_once(cfg: Dict[str, Any]) -> None:
                             print(f"[WARN] send_wecom_text failed: {e}")
 
             elif signal == -1:
+                # 做空信号
                 if has_short:
                     print("[ACTION] already short, no new short opened")
                 else:
-                    action_desc = "close_long_then_open_short" if has_long else "open_short"
+                    action_desc = "open_short"
                     if has_long:
                         print("[ACTION] close_long then open_short")
+                        action_desc = "close_long_then_open_short"
                         try:
                             trader.close_long(inst_id)
                         except Exception as e:
@@ -182,13 +192,13 @@ def run_once(cfg: Dict[str, Any]) -> None:
 
                     trader.open_short(inst_id, ref_price=last)
 
-                    # === 企业微信推送（做空开仓成功后） ===
+                    # WeCom 推送
                     if send_wecom_text is not None:
                         msg = (
                             f"[开空] {symbol} / {inst_id}\n"
                             f"价格: {last}\n"
-                            f"信号: {info}\n"
-                            f"动作: {action_desc}"
+                            f"动作: {action_desc}\n"
+                            f"信号详情: {info}"
                         )
                         try:
                             send_wecom_text(msg)
@@ -198,6 +208,7 @@ def run_once(cfg: Dict[str, Any]) -> None:
         except Exception as e:
             print(f"[ERROR] trade action failed for {inst_id}: {e}")
 
+        # 6. 给接口一点喘息时间
         time.sleep(0.5)
 
 
