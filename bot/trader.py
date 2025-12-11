@@ -8,6 +8,9 @@ from typing import Any, Dict, Optional, List
 
 import requests
 import urllib.parse
+import pandas as pd
+from datetime import datetime, timezone
+
 
 
 CONFIG_PATH = os.environ.get("BOT_CONFIG_PATH", "config/params.json")
@@ -426,6 +429,39 @@ class OKXTrader:
         short_sz = self._get_current_pos_size(inst_id, "short")
         if short_sz and short_sz != "0":
             self.close_short(inst_id, short_sz)
+            
+    def get_klines(self, inst_id: str, bar: str = "1H", limit: int = 200) -> pd.DataFrame:
+        """
+        从 OKX 获取 K 线数据，返回按时间从旧到新的 DataFrame，
+        列包括: open_time, open, high, low, close, volume
+
+        inst_id: 例如 "BTC-USDT-SWAP"
+        bar:    例如 "1H", "4H"
+        limit:  获取多少根，最大 200
+        """
+        path = "/api/v5/market/candles"
+        params = {
+            "instId": inst_id,
+            "bar": bar,
+            "limit": str(limit),
+        }
+        data = self._request("GET", path, params=params)
+
+        # OKX 返回是「最新在前」，我们反转成「最老在前」
+        rows = []
+        for item in reversed(data):
+            # 文档格式: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm, ...]
+            ts, o, h, l, c, vol, *_ = item
+            rows.append({
+                "open_time": datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc),
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+                "volume": float(vol),
+            })
+
+        return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
