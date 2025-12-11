@@ -5,7 +5,13 @@ strategy.py
 - 根据 K 线数据 + 配置，生成交易信号
 - 分两层：
   1）基础信号层（双均线方向） -> raw_signal ∈ {-1, 0, 1}
-  2）过滤层（趋势过滤 + RSI + 暴跌 + 波动率 + EMA 斜率） -> final_signal ∈ {-1, 0, 1}
+  2）过滤层：
+     - 高周期趋势过滤
+     - RSI 过滤
+     - 暴跌过滤
+     - 突破确认过滤（新加）
+     - ATR 波动率过滤
+     - EMA 斜率过滤
 
 说明：
 - 本文件不直接下单，只负责“要不要做多/做空/观望”的决策。
@@ -95,7 +101,7 @@ def atr_from_closes(series: List[float], period: int) -> Optional[float]:
     """
     用收盘价近似 ATR：
     ATR ≈ 最近 period 根 K 线的平均 |close[i] - close[i-1]|
-    不是教科书级别，但对过滤震荡行情足够了。
+    对过滤震荡行情足够了。
     """
     n = len(series)
     if n < period + 1 or period <= 0:
@@ -106,6 +112,19 @@ def atr_from_closes(series: List[float], period: int) -> Optional[float]:
     if not recent_trs:
         return None
     return sum(recent_trs) / len(recent_trs)
+
+
+def recent_high_low(series: List[float], lookback: int) -> Tuple[Optional[float], Optional[float]]:
+    """
+    计算最近 lookback 根（不含当前这根）的最高价和最低价。
+    用于突破确认。
+    """
+    n = len(series)
+    if n <= lookback:
+        return None, None
+
+    window = series[-1 - lookback:-1]
+    return max(window), min(window)
 
 
 # ---------- ① 基础信号层：双均线“方向信号” ----------
@@ -123,10 +142,6 @@ def base_signal_from_ma(
     - fast_ema > slow_ema 且差值足够 → 1（偏多）
     - fast_ema < slow_ema 且差值足够 → -1（偏空）
     - 两条线非常接近 → 0（认为是震荡，不发信号）
-
-    注意：
-    - 这样每根 K 都会给出一个方向，但我们在 main.py 里只在
-      “当前持仓方向 != 信号方向” 时才开新仓，所以不会疯狂加仓。
     """
     info: Dict[str, float] = {}
 
@@ -157,7 +172,7 @@ def base_signal_from_ma(
         return -1, info
 
 
-# ---------- ② 过滤层：趋势 / RSI / 暴跌 / 波动率 / 斜率 ----------
+# ---------- ② 过滤层：趋势 / RSI / 暴跌 / 突破 / 波动率 / 斜率 ----------
 
 def detect_htf_trend(
     htf_closes: List[float],
@@ -222,8 +237,8 @@ def apply_filters(
     last_rsi = rsi_vals[-1] if rsi_vals else None
     debug_info["rsi"] = last_rsi
 
-    long_overbought = float(cfg_filters.get("rsi_long_overbought", 80))  # 默认 80，比较难挡住多头
-    short_oversold = float(cfg_filters.get("rsi_short_oversold", 20))    # 默认 20，比较难挡住空头
+    long_overbought = float(cfg_filters.get("rsi_long_overbought", 80))  # 默认 80
+    short_oversold = float(cfg_filters.get("rsi_short_oversold", 20))    # 默认 20
 
     if last_rsi is not None:
         if final_signal == 1 and last_rsi >= long_overbought:
@@ -243,7 +258,28 @@ def apply_filters(
         debug_info["blocked_by_crash"] = "long_blocked_after_crash"
         final_signal = 0
 
-    # --- 4）ATR 波动率过滤 ---
+    # --- 4）突破确认过滤（新加） ---
+    breakout_lookback = int(cfg_filters.get("breakout_lookback", 5))
+    last_close = closes[-1]
+
+    if final_signal != 0 and breakout_lookback > 0:
+        recent_high, recent_low = recent_high_low(closes, breakout_lookback)
+        debug_info["recent_high"] = recent_high
+        debug_info["recent_low"] = recent_low
+
+        if recent_high is not None and recent_low is not None:
+            if final_signal == 1:
+                # 做多必须突破最近高点
+                if not (last_close > recent_high):
+                    debug_info["blocked_by_breakout"] = f"no_long_breakout: close={last_close} <= high={recent_high}"
+                    final_signal = 0
+            elif final_signal == -1:
+                # 做空必须跌破最近低点
+                if not (last_close < recent_low):
+                    debug_info["blocked_by_breakout"] = f"no_short_breakout: close={last_close} >= low={recent_low}"
+                    final_signal = 0
+
+    # --- 5）ATR 波动率过滤 ---
     atr_period = int(cfg_filters.get("atr_period", 14))
     atr_min_pct = float(cfg_filters.get("atr_min_pct", 0.002))  # 比如 0.2% 的日内波动
 
@@ -256,11 +292,10 @@ def apply_filters(
     debug_info["atr_pct"] = atr_pct
 
     if atr_pct is not None and atr_pct < atr_min_pct:
-        # 波动太小，视为震荡，不做
         debug_info["blocked_by_atr"] = f"low_vol: atr_pct={atr_pct:.6f} < {atr_min_pct:.6f}"
         final_signal = 0
 
-    # --- 5）EMA 斜率过滤（角度过滤） ---
+    # --- 6）EMA 斜率过滤（角度过滤） ---
     fast_len = int(debug_info.get("fast", cfg_filters.get("fast_len_for_slope", 12)))
     slope_lookback = int(cfg_filters.get("slope_lookback", 3))
     slope_min_abs = float(cfg_filters.get("slope_min_abs", 0.0005))  # 0.05%
@@ -280,7 +315,6 @@ def apply_filters(
             debug_info["blocked_by_slope"] = f"flat_ma: slope={fast_slope:.6f} < {slope_min_abs:.6f}"
             final_signal = 0
         else:
-            # 方向与信号不一致也过滤掉
             if final_signal == 1 and fast_slope < 0:
                 debug_info["blocked_by_slope"] = f"long_blocked_by_down_slope: slope={fast_slope:.6f}"
                 final_signal = 0
@@ -325,7 +359,6 @@ def generate_signal(
     debug_info["sig"] = sig
 
     if raw_signal == 0:
-        # 没有明显方向（快慢 EMA 几乎重合），这里直接返回 0
         debug_info["reason"] = "ma_flat"
         if debug:
             print(f"[DEBUG][strategy] {symbol} -> raw=0, info={debug_info}")
