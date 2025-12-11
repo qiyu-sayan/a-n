@@ -25,7 +25,10 @@ def symbol_to_inst_id(symbol: str) -> str:
     """
     把 BTCUSDT -> BTC-USDT-SWAP
        ETHUSDT -> ETH-USDT-SWAP
+       BNBUSDT -> BNB-USDT-SWAP
+       ASTERUSDT -> ASTER-USDT-SWAP
     """
+    symbol = symbol.upper()
     if symbol.endswith("USDT"):
         base = symbol[:-4]
     else:
@@ -54,22 +57,13 @@ def fetch_klines(
     if data.get("code") != "0":
         raise RuntimeError(f"fetch_klines error: {data}")
     klines = data.get("data", [])
-    # OKX 返回是最新在前，这里反转一下方便做指标
     klines.reverse()
     return klines
 
 
 def interval_to_bar(interval: str) -> str:
-    """
-    把配置里的 interval 映射成 OKX 的 bar 参数。
-    例如：
-        "1h" -> "1H"
-        "4h" -> "4H"
-        "15m" -> "15m"
-    """
     if not interval:
         return "1H"
-    # 简单粗暴：h 变大写 H，其他保持不动
     return interval.replace("h", "H")
 
 
@@ -78,15 +72,13 @@ def run_once(cfg: Dict[str, Any]) -> None:
     跑一轮：对每个 symbol 做一次信号判断和下单。
     由 GitHub Actions 定时唤醒，所以这里只跑一轮即可。
     """
-    trader = OKXTrader(cfg, use_demo=True)  # 现在先默认模拟盘
+    trader = OKXTrader(cfg, use_demo=True)  # 目前默认模拟盘
 
-    base_url = trader.base_url  # https://www.okx.com 或模拟盘地址
+    base_url = trader.base_url
     symbols = cfg.get("symbols", ["BTCUSDT", "ETHUSDT"])
     interval = cfg.get("interval", "1h")
     bar = interval_to_bar(interval)
-
-    # 高周期（趋势）用 4h，可以以后做成配置
-    htf_bar = "4H"
+    htf_bar = "4H"  # 高周期
 
     print(f"Running bot once, interval={interval}, bar={bar}, htf_bar={htf_bar}")
     for symbol in symbols:
@@ -110,41 +102,67 @@ def run_once(cfg: Dict[str, Any]) -> None:
 
         print(f"[INFO] signal for {symbol}: {signal}, info: {info}")
 
-        # 不发新信号就跳过
         if signal == 0:
             continue
 
-        # 下单前先获取一眼价格，仅用于日志（真正下单时 trader 会自己取最新价）
+        # 当前仓位情况
+        has_long = False
+        has_short = False
+        try:
+            positions = trader.get_positions(inst_id)
+            for p in positions:
+                try:
+                    pos = float(p.get("pos", "0"))
+                    side = p.get("posSide")
+                    if pos > 0:
+                        if side == "long":
+                            has_long = True
+                        elif side == "short":
+                            has_short = True
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[WARN] get_positions failed for {inst_id}: {e}")
+
+        # 仅当 signal 与当前持仓方向“不一致”时才动作
         try:
             last = trader.get_last_price(inst_id)
         except Exception:
             last = None
         print(f"[INFO] last price {inst_id} = {last}")
 
-        # 简单的“净仓”风格：
-        # - 做多信号：先平空，再开多
-        # - 做空信号：先平多，再开空
         try:
             if signal == 1:
-                print("[ACTION] close_short then open_long")
-                try:
-                    trader.close_short(inst_id)
-                except Exception as e:
-                    print(f"[WARN] close_short failed (maybe no short position): {e}")
-                trader.open_long(inst_id, ref_price=last)
+                if has_long:
+                    print("[ACTION] already long, no new long opened")
+                else:
+                    if has_short:
+                        print("[ACTION] close_short then open_long")
+                        try:
+                            trader.close_short(inst_id)
+                        except Exception as e:
+                            print(f"[WARN] close_short failed: {e}")
+                    else:
+                        print("[ACTION] open_long (no existing position)")
+                    trader.open_long(inst_id, ref_price=last)
 
             elif signal == -1:
-                print("[ACTION] close_long then open_short")
-                try:
-                    trader.close_long(inst_id)
-                except Exception as e:
-                    print(f"[WARN] close_long failed (maybe no long position): {e}")
-                trader.open_short(inst_id, ref_price=last)
+                if has_short:
+                    print("[ACTION] already short, no new short opened")
+                else:
+                    if has_long:
+                        print("[ACTION] close_long then open_short")
+                        try:
+                            trader.close_long(inst_id)
+                        except Exception as e:
+                            print(f"[WARN] close_long failed: {e}")
+                    else:
+                        print("[ACTION] open_short (no existing position)")
+                    trader.open_short(inst_id, ref_price=last)
 
         except Exception as e:
             print(f"[ERROR] trade action failed for {inst_id}: {e}")
 
-        # 给接口留一点喘息时间
         time.sleep(0.5)
 
 
