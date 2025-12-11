@@ -30,8 +30,9 @@ jobs:
 
       - name: Run test_okx_trader
         env:
-          OKX_API_KEY: ${{ secrets.OKX_DEMO_API_KEY }}
-          OKX_API_SECRET: ${{ secrets.OKX_DEMO_API_SECRET }}
-          OKX_API_PASSPHRASE: ${{ secrets.OKX_DEMO_API_PASSPHRASE }}
+          OKX_API_KEY: ${{ secrets.OKX_PAPER_API_KEY }}
+          OKX_API_SECRET: ${{ secrets.OKX_PAPER_API_SECRET }}
+          OKX_API_PASSPHRASE: ${{ secrets.OKX_PAPER_API_PASSPHRASE }}
         run: |
           python test_okx_trader.py
+
