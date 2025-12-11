@@ -1,8 +1,11 @@
 {
   "symbols": [
     "BTCUSDT",
-    "ETHUSDT"
+    "ETHUSDT",
+    "BNBUSDT",
+    "ASTERUSDT"
   ],
+
 
   "interval": "1h",
 
