@@ -1,45 +1,63 @@
-"""
-main.py
-
-职责：
-- 读取配置
-- 为每个交易对获取 K 线数据
-- 调用 strategy.generate_signal 生成信号
-- 调用 OKXTrader 在 OKX 上开仓 / 平仓
-- 有实际开新仓时，通过企业微信推送一条消息
-
-运行方式：
-    python -m bot.main
-由 GitHub Actions 的 run-bot workflow 定时触发。
-"""
-
-import time
-from typing import Dict, Any, List
-
-import requests
+import os
+from typing import Dict, Any, List, Optional, Tuple
 
 from bot.trader import OKXTrader, load_config
 from bot.strategy import generate_signal
 
-# 企业微信推送
 try:
-    from wecom_notify import send_wecom_text
-except Exception:
-    send_wecom_text = None
+    # 项目根目录下的企业微信通知脚本
+    from wecom_notify import send_text as send_wecom_text
+except ImportError:
+    # 如果没配置企业微信，也不影响核心逻辑
+    def send_wecom_text(msg: str) -> None:
+        print(f"[WECOM MOCK] {msg}")
+
+
+# ----------------------- 工具函数 -----------------------
+
+
+def symbol_to_inst_id(symbol: str) -> str:
+    """
+    目前你的 OKX 合约都是 USDT 本位永续，形如：
+    BTCUSDT -> BTC-USDT-SWAP
+    """
+    base = symbol.replace("USDT", "")
+    return f"{base}-USDT-SWAP"
+
+
+def pick_side_position(
+    positions: List[Dict[str, Any]], side: str
+) -> Optional[Dict[str, Any]]:
+    """
+    从 OKX 持仓列表中挑出指定 posSide 的持仓。
+    side: "long" / "short"
+    """
+    for p in positions:
+        try:
+            if p.get("posSide") == side and float(p.get("pos", "0")) != 0:
+                return p
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+# ------------------- 风险管理：止盈止损 -------------------
+
 
 def check_risk_close(
-    symbol,
-    inst_id,
-    last_price,
-    positions,
-    cfg,
-    trader,
-    send_wecom_text=None,
-):
+    symbol: str,
+    inst_id: str,
+    last_price: float,
+    positions: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    trader: OKXTrader,
+    send_wecom_text_func=send_wecom_text,
+) -> bool:
     """
     根据配置里的 stop / take，对当前持仓做止盈止损检查。
-    返回值：
-        True  -> 发生了平仓，本轮后续不再开新仓
+
+    返回值:
+        True  -> 发生了平仓，本轮应该跳过开新仓
         False -> 没有触发止盈止损
     """
     risk = cfg.get("risk", {})
@@ -53,12 +71,15 @@ def check_risk_close(
 
     for pos in positions:
         try:
-            side = pos.get("posSide")          # "long" 或 "short"
+            side = pos.get("posSide")          # "long" / "short"
             pos_sz = float(pos.get("pos", "0"))
             if pos_sz == 0:
                 continue
             avg_px = float(pos.get("avgPx"))
         except (TypeError, ValueError):
+            continue
+
+        if last_price <= 0 or avg_px <= 0:
             continue
 
         # 计算浮动收益百分比
@@ -72,17 +93,23 @@ def check_risk_close(
         reason = None
         # 止损优先
         if pnl_pct <= -stop_pct:
-            reason = f"止损触发：浮动收益 {pnl_pct * 100:.2f}% ≤ -{stop_pct * 100:.2f}%"
+            reason = (
+                f"止损触发：浮动收益 {pnl_pct * 100:.2f}% ≤ "
+                f"-{stop_pct * 100:.2f}%"
+            )
         # 再看止盈
         elif pnl_pct >= take_pct:
-            reason = f"止盈触发：浮动收益 {pnl_pct * 100:.2f}% ≥ {take_pct * 100:.2f}%"
+            reason = (
+                f"止盈触发：浮动收益 {pnl_pct * 100:.2f}% ≥ "
+                f"{take_pct * 100:.2f}%"
+            )
 
         if not reason:
             continue
 
-        # 打印日志 + 平仓
         if side == "long":
             print(f"[RISK] Closing LONG {symbol} by rule: {reason}")
+            # 按仓位数量平多
             trader.close_long(inst_id, abs(pos_sz))
             side_cn = "多"
         else:
@@ -90,97 +117,51 @@ def check_risk_close(
             trader.close_short(inst_id, abs(pos_sz))
             side_cn = "空"
 
-        # 企业微信推送
-        if send_wecom_text is not None:
+        # 企业微信通知
+        try:
             msg = (
                 f"[风险平仓-{symbol}] 平{side_cn}仓\n"
                 f"{reason}\n"
                 f"开仓价: {avg_px}, 当前价: {last_price}\n"
                 f"浮动收益: {pnl_pct * 100:.2f}%"
             )
-            try:
-                send_wecom_text(msg)
-            except Exception as e:
-                print(f"[WARN] wecom notify failed: {e}")
+            send_wecom_text_func(msg)
+        except Exception as e:
+            print(f"[WARN] wecom notify failed: {e}")
 
         closed_any = True
 
     return closed_any
 
 
-def symbol_to_inst_id(symbol: str) -> str:
-    """
-    把 BTCUSDT -> BTC-USDT-SWAP
-       ETHUSDT -> ETH-USDT-SWAP
-       BNBUSDT -> BNB-USDT-SWAP
-       ASTERUSDT -> ASTER-USDT-SWAP
-    """
-    symbol = symbol.upper()
-    if symbol.endswith("USDT"):
-        base = symbol[:-4]
-    else:
-        base = symbol
-    return f"{base}-USDT-SWAP"
-
-
-def fetch_klines(
-    base_url: str,
-    inst_id: str,
-    bar: str,
-    limit: int = 200,
-) -> List[List[Any]]:
-    """
-    从 OKX 公共接口获取 K 线数据。
-    返回按时间从旧 -> 新排序的列表。
-    """
-    url = base_url + "/api/v5/market/candles"
-    params = {
-        "instId": inst_id,
-        "bar": bar,
-        "limit": str(limit),
-    }
-    resp = requests.get(url, params=params, timeout=10)
-    data = resp.json()
-    if data.get("code") != "0":
-        raise RuntimeError(f"fetch_klines error: {data}")
-    klines = data.get("data", [])
-    klines.reverse()
-    return klines
-
-
-def interval_to_bar(interval: str) -> str:
-    if not interval:
-        return "1H"
-    return interval.replace("h", "H")
+# ----------------------- 主逻辑 -----------------------
 
 
 def run_once(cfg: Dict[str, Any]) -> None:
-    """
-    跑一轮：对每个 symbol 做一次信号判断和下单。
-    由 GitHub Actions 定时唤醒，所以这里只跑一轮即可。
-    """
-    trader = OKXTrader(cfg, use_demo=True)  # 目前默认模拟盘
-
-    base_url = trader.base_url
-    symbols = cfg.get("symbols", ["BTCUSDT", "ETHUSDT"])
     interval = cfg.get("interval", "1h")
-    bar = interval_to_bar(interval)
-    htf_bar = "4H"  # 高周期
-
+    bar = "1H"          # 交易级别
+    htf_bar = "4H"      # 高周期过滤用
     print(f"Running bot once, interval={interval}, bar={bar}, htf_bar={htf_bar}")
-    for symbol in symbols:
-        inst_id = symbol_to_inst_id(symbol)
-        print(f"\n=== {symbol} / {inst_id} ===")
 
-        # 1. 获取 K 线
+    env = os.getenv("BOT_ENV", "test").lower()
+    use_demo = env != "live"
+    print(f"[ENV] BOT_ENV={env}, use_demo={use_demo}")
+
+    trader = OKXTrader(cfg, use_demo=use_demo)
+
+    for symbol in cfg.get("symbols", []):
+        inst_id = symbol_to_inst_id(symbol)
+        print(f"=== {symbol} / {inst_id} ===")
+
+        # --- 获取 K 线数据 ---
         try:
-            klines = fetch_klines(base_url, inst_id, bar, limit=200)
-            htf_klines = fetch_klines(base_url, inst_id, htf_bar, limit=200)
+            klines = trader.get_klines(inst_id, bar, 300)
+            htf_klines = trader.get_klines(inst_id, htf_bar, 300)
         except Exception as e:
-            print(f"[ERROR] fetch_klines failed for {inst_id}: {e}")
+            print(f"[ERROR] fetch klines failed for {symbol}: {e}")
             continue
 
-        # 2. 生成信号
+        # --- 生成策略信号 ---
         signal, info = generate_signal(
             symbol=symbol,
             klines=klines,
@@ -188,111 +169,125 @@ def run_once(cfg: Dict[str, Any]) -> None:
             htf_klines=htf_klines,
             debug=True,
         )
-
         print(f"[INFO] signal for {symbol}: {signal}, info: {info}")
 
-        if signal == 0:
-            # 没有可执行信号
-            continue
-
-        # 3. 查询当前仓位
-        has_long = False
-        has_short = False
-        try:
-            positions = trader.get_positions(inst_id)
-            for p in positions:
-                try:
-                    pos = float(p.get("pos", "0"))
-                    side = p.get("posSide")
-                    if pos > 0:
-                        if side == "long":
-                            has_long = True
-                        elif side == "short":
-                            has_short = True
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"[WARN] get_positions failed for {inst_id}: {e}")
-
-        # 4. 最新价格（用于日志 & 推送）
+        # --- 最新价格 ---
         try:
             last = trader.get_last_price(inst_id)
-        except Exception:
-            last = None
+        except Exception as e:
+            print(f"[ERROR] get_last_price failed for {symbol}: {e}")
+            continue
+
         print(f"[INFO] last price {inst_id} = {last}")
 
-        # 5. 根据信号 + 当前仓位执行操作，并在真正开新仓时推送企业微信
+        # --- 当前持仓 ---
         try:
-            if signal == 1:
-                # 做多信号
-                if has_long:
-                    print("[ACTION] already long, no new long opened")
-                else:
-                    action_desc = "open_long"
-                    if has_short:
-                        print("[ACTION] close_short then open_long")
-                        action_desc = "close_short_then_open_long"
-                        try:
-                            trader.close_short(inst_id)
-                        except Exception as e:
-                            print(f"[WARN] close_short failed: {e}")
-                    else:
-                        print("[ACTION] open_long (no existing position)")
-
-                    trader.open_long(inst_id, ref_price=last)
-
-                    # WeCom 推送
-                    if send_wecom_text is not None:
-                        msg = (
-                            f"[开多] {symbol} / {inst_id}\n"
-                            f"价格: {last}\n"
-                            f"动作: {action_desc}\n"
-                            f"信号详情: {info}"
-                        )
-                        try:
-                            send_wecom_text(msg)
-                        except Exception as e:
-                            print(f"[WARN] send_wecom_text failed: {e}")
-
-            elif signal == -1:
-                # 做空信号
-                if has_short:
-                    print("[ACTION] already short, no new short opened")
-                else:
-                    action_desc = "open_short"
-                    if has_long:
-                        print("[ACTION] close_long then open_short")
-                        action_desc = "close_long_then_open_short"
-                        try:
-                            trader.close_long(inst_id)
-                        except Exception as e:
-                            print(f"[WARN] close_long failed: {e}")
-                    else:
-                        print("[ACTION] open_short (no existing position)")
-
-                    trader.open_short(inst_id, ref_price=last)
-
-                    # WeCom 推送
-                    if send_wecom_text is not None:
-                        msg = (
-                            f"[开空] {symbol} / {inst_id}\n"
-                            f"价格: {last}\n"
-                            f"动作: {action_desc}\n"
-                            f"信号详情: {info}"
-                        )
-                        try:
-                            send_wecom_text(msg)
-                        except Exception as e:
-                            print(f"[WARN] send_wecom_text failed: {e}")
-
+            positions = trader.get_positions(inst_id)
         except Exception as e:
-            print(f"[ERROR] trade action failed for {inst_id}: {e}")
+            print(f"[ERROR] get_positions failed for {symbol}: {e}")
+            continue
 
-        # 6. 给接口一点喘息时间
-        time.sleep(0.5)
+        long_pos = pick_side_position(positions, "long")
+        short_pos = pick_side_position(positions, "short")
+
+        # --- 风险管理：先检查是否需要止盈/止损平仓 ---
+        try:
+            closed_by_risk = check_risk_close(
+                symbol=symbol,
+                inst_id=inst_id,
+                last_price=last,
+                positions=positions,
+                cfg=cfg,
+                trader=trader,
+                send_wecom_text_func=send_wecom_text,
+            )
+        except Exception as e:
+            print(f"[ERROR] risk check failed for {symbol}: {e}")
+            closed_by_risk = False
+
+        if closed_by_risk:
+            print(
+                f"[ACTION] {symbol}: position closed by risk rules, "
+                f"skip new orders this round."
+            )
+            # 下一轮循环再重新看信号
+            continue
+
+        # ==========================
+        # 下面是根据“策略信号”和“当前持仓”决定操作
+        # ==========================
+
+        # ---------- 做多信号 ----------
+        if signal == 1:
+            if long_pos:
+                # 已经有多单，就不新增
+                print("[ACTION] already long, no new long opened")
+                continue
+
+            # 如有空单，先平空再开多
+            if short_pos:
+                try:
+                    sz = abs(float(short_pos.get("pos", "0")))
+                except (TypeError, ValueError):
+                    sz = 0
+                if sz > 0:
+                    print("[ACTION] close existing SHORT before opening LONG")
+                    trader.close_short(inst_id, sz)
+
+            print("Opening long ...")
+            resp_open = trader.open_long(inst_id, last)
+            print(f"open_long resp: {resp_open}")
+
+            # 企业微信通知
+            try:
+                msg = (
+                    f"[开多-{symbol}] 信号=多\n"
+                    f"价格: {last}\n"
+                    f"详情: {info}"
+                )
+                send_wecom_text(msg)
+            except Exception as e:
+                print(f"[WARN] wecom notify failed: {e}")
+
+        # ---------- 做空信号 ----------
+        elif signal == -1:
+            if short_pos:
+                print("[ACTION] already short, no new short opened")
+                continue
+
+            # 如有多单，先平多再开空
+            if long_pos:
+                try:
+                    sz = abs(float(long_pos.get("pos", "0")))
+                except (TypeError, ValueError):
+                    sz = 0
+                if sz > 0:
+                    print("[ACTION] close existing LONG before opening SHORT")
+                    trader.close_long(inst_id, sz)
+
+            print("Opening short ...")
+            resp_open = trader.open_short(inst_id, last)
+            print(f"open_short resp: {resp_open}")
+
+            # 企业微信通知
+            try:
+                msg = (
+                    f"[开空-{symbol}] 信号=空\n"
+                    f"价格: {last}\n"
+                    f"详情: {info}"
+                )
+                send_wecom_text(msg)
+            except Exception as e:
+                print(f"[WARN] wecom notify failed: {e}")
+
+        # ---------- 无信号：不操作 ----------
+        else:
+            print("[ACTION] no clear signal, do nothing.")
+
+    print("Run once done.")
 
 
-def main():
+def main() -> None:
     cfg = load_config()
     run_once(cfg)
 
