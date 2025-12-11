@@ -19,6 +19,11 @@ jobs:
       OKX_PAPER_API_KEY: ${{ secrets.OKX_PAPER_API_KEY }}
       OKX_PAPER_API_SECRET: ${{ secrets.OKX_PAPER_API_SECRET }}
       OKX_PAPER_API_PASSPHRASE: ${{ secrets.OKX_PAPER_API_PASSPHRASE }}
+      
+        # ✅ 新增三行，给 trader.py 用
+      OKX_API_KEY: ${{ secrets.OKX_PAPER_API_KEY }}
+      OKX_API_SECRET: ${{ secrets.OKX_PAPER_API_SECRET }}
+      OKX_API_PASSPHRASE: ${{ secrets.OKX_PAPER_API_PASSPHRASE }}
 
       # OKX 实盘 API（现在用不到，但先保留）
       OKX_LIVE_API_KEY: ${{ secrets.OKX_LIVE_API_KEY }}
