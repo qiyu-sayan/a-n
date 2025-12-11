@@ -185,23 +185,30 @@ class OKXTrader:
         equity = self.get_equity_usdt()
         notional = equity * max_pos_pct  # 计划使用的 USDT 名义价值
 
-        # 合约面值：例如 BTC-USDT-SWAP ctVal=1 → 1 USDT/张
         ct_val = self.get_contract_value(inst_id)
 
-        # 如果是币本位合约，ctVal 表示多少 BTC/张，这里简单假设 USDT 本位，ctVal 即 1 USDT/张
-        # 为保险起见：notional / (ct_val * ref_price) 也可，但 OKX U 本位永续一般 ctVal=1
         if ct_val <= 0:
             ct_val = 1.0
 
-        # 如果有 ref_price，可以用 notional / (ct_val * ref_price) 算“张数”更精细
+        # ✅ 正确公式：每张合约的名义价值 ≈ ctVal * 当前价格
+        # 计划名义价值 / 每张名义价值 = 张数
         if ref_price and ref_price > 0:
-            sz = int(notional / (ct_val * 1.0))  # 保守一点，不用价格放大
+            contract_notional = ct_val * ref_price
+            if contract_notional <= 0:
+                contract_notional = ref_price  # 兜底
+            sz = int(notional / contract_notional)
         else:
+            # 没有价格时的兜底：尽量小
             sz = int(notional / ct_val)
 
         if sz < 1:
             sz = 1
+
+        print(f"[DEBUG] equity={equity}, max_pos_pct={max_pos_pct}, notional={notional}, "
+              f"ct_val={ct_val}, ref_price={ref_price}, sz={sz}")
+
         return str(sz)
+
 
     def _build_tp_sl(
         self,
