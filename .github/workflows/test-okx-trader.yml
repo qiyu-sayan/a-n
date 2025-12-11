@@ -1,0 +1,37 @@
+name: Test OKX Trader
+
+on:
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  test-okx-trader:
+    # 👇 这里非常重要：用你 VPS 的 self-hosted runner
+    # 建议直接复制你现在 run-bot.yml 里的 runs-on 配置
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'  # 或者你现在机器人用的版本
+
+      - name: Install dependencies
+        # 如果你项目有 requirements.txt 就用这一行
+        # 没有的话，可以暂时改成 "pip install requests"
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests
+          fi
+
+      - name: Run test_okx_trader
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_DEMO_API_KEY }}
+          OKX_API_SECRET: ${{ secrets.OKX_DEMO_API_SECRET }}
+          OKX_API_PASSPHRASE: ${{ secrets.OKX_DEMO_API_PASSPHRASE }}
+        run: |
+          python test_okx_trader.py
