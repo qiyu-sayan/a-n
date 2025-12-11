@@ -84,7 +84,15 @@ class OKXTrader:
         url = self.base_url + path
         ts = self._timestamp()
         body_str = json.dumps(body) if body else ""
-        sign = self._sign(ts, method, path, body_str)
+
+        # ✅ 对 GET 请求，把 query 一起参与签名
+        if params:
+            query_str = urllib.parse.urlencode(params)
+            sign_path = f"{path}?{query_str}"
+        else:
+            sign_path = path
+
+        sign = self._sign(ts, method, sign_path, body_str)
 
         headers = {
             "OK-ACCESS-KEY": self.api_key,
@@ -106,10 +114,10 @@ class OKXTrader:
         )
         data = resp.json()
         if data.get("code") != "0":
-            # 打印完整返回，方便在 GitHub Actions 日志里看到 sCode/sMsg
             print("OKX raw error response:", data)
             raise OKXAPIError(f"OKX API error: {data.get('code')} {data.get('msg')}")
         return data
+
 
 
     # ---------- 公共数据 / 账户信息 ----------
