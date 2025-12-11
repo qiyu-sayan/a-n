@@ -55,4 +55,294 @@ def rsi(series: List[float], period: int) -> List[Optional[float]]:
     返回与 series 等长的 RSI 列表，前期用 None 填充。
     """
     n = len(series)
-    if n == 0 or period <= 0
+    if n == 0 or period <= 0 or n < period + 1:
+        return []
+
+    deltas = [series[i] - series[i - 1] for i in range(1, n)]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    rsi_vals: List[Optional[float]] = [None] * (period + 1)
+    if avg_loss == 0:
+        rsi_vals[-1] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_vals[-1] = 100 - (100 / (1 + rs))
+
+    for i in range(period, len(deltas)):
+        gain = gains[i]
+        loss = losses[i]
+
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+
+        if avg_loss == 0:
+            rsi_vals.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi_vals.append(100 - (100 / (1 + rs)))
+
+    while len(rsi_vals) < n:
+        rsi_vals.insert(0, None)
+
+    return rsi_vals[:n]
+
+
+def atr_from_closes(series: List[float], period: int) -> Optional[float]:
+    """
+    用收盘价近似 ATR：
+    ATR ≈ 最近 period 根 K 线的平均 |close[i] - close[i-1]|
+    不是教科书级别，但对过滤震荡行情足够了。
+    """
+    n = len(series)
+    if n < period + 1 or period <= 0:
+        return None
+
+    trs = [abs(series[i] - series[i - 1]) for i in range(1, n)]
+    recent_trs = trs[-period:]
+    if not recent_trs:
+        return None
+    return sum(recent_trs) / len(recent_trs)
+
+
+# ---------- ① 基础信号层：双均线“方向信号” ----------
+
+def base_signal_from_ma(
+    closes: List[float],
+    fast: int,
+    slow: int,
+    sig: int,  # 预留，用于未来扩展
+) -> Tuple[int, Dict[str, float]]:
+    """
+    返回原始信号 raw_signal ∈ {-1, 0, 1}
+
+    逻辑：
+    - fast_ema > slow_ema 且差值足够 → 1（偏多）
+    - fast_ema < slow_ema 且差值足够 → -1（偏空）
+    - 两条线非常接近 → 0（认为是震荡，不发信号）
+
+    注意：
+    - 这样每根 K 都会给出一个方向，但我们在 main.py 里只在
+      “当前持仓方向 != 信号方向” 时才开新仓，所以不会疯狂加仓。
+    """
+    info: Dict[str, float] = {}
+
+    if len(closes) < slow + 1:
+        return 0, info
+
+    fast_ema_vals = ema(closes, fast)
+    slow_ema_vals = ema(closes, slow)
+
+    fast_last = fast_ema_vals[-1]
+    slow_last = slow_ema_vals[-1]
+    diff = fast_last - slow_last
+    rel_diff = diff / slow_last if slow_last != 0 else 0.0
+
+    info["fast_ema"] = fast_last
+    info["slow_ema"] = slow_last
+    info["ma_diff"] = diff
+    info["ma_rel_diff"] = rel_diff
+
+    # 阈值：当快慢 EMA 差距小于 0.03% 时认为是“几乎重合”，不做方向判断
+    flat_threshold = 0.0003
+    if abs(rel_diff) < flat_threshold:
+        return 0, info
+
+    if rel_diff > 0:
+        return 1, info
+    else:
+        return -1, info
+
+
+# ---------- ② 过滤层：趋势 / RSI / 暴跌 / 波动率 / 斜率 ----------
+
+def detect_htf_trend(
+    htf_closes: List[float],
+    ma_period: int,
+) -> str:
+    if not htf_closes or len(htf_closes) < ma_period:
+        return "unknown"
+
+    ma_vals = ema(htf_closes, ma_period)
+    last_close = htf_closes[-1]
+    last_ma = ma_vals[-1]
+
+    if last_close > last_ma:
+        return "up"
+    elif last_close < last_ma:
+        return "down"
+    else:
+        return "flat"
+
+
+def detect_crash(
+    closes: List[float],
+    lookback: int,
+    threshold: float,
+) -> bool:
+    if len(closes) < lookback + 1 or lookback <= 0:
+        return False
+
+    last = closes[-1]
+    prev = closes[-1 - lookback]
+
+    pct_change = (last - prev) / prev
+    return pct_change <= threshold
+
+
+def apply_filters(
+    raw_signal: int,
+    closes: List[float],
+    htf_closes: Optional[List[float]],
+    cfg_filters: Dict[str, Any],
+    debug_info: Dict[str, Any],
+) -> int:
+    final_signal = raw_signal
+
+    # --- 1）高周期趋势过滤 ---
+    htf_trend = "unknown"
+    htf_period = int(cfg_filters.get("htf_ma_period", 50))
+    if htf_closes:
+        htf_trend = detect_htf_trend(htf_closes, htf_period)
+    debug_info["htf_trend"] = htf_trend
+
+    if final_signal == 1 and htf_trend == "down":
+        debug_info["blocked_by_htf_trend"] = "long_blocked_in_downtrend"
+        final_signal = 0
+    elif final_signal == -1 and htf_trend == "up":
+        debug_info["blocked_by_htf_trend"] = "short_blocked_in_uptrend"
+        final_signal = 0
+
+    # --- 2）RSI 过滤（默认阈值偏宽松） ---
+    rsi_period = int(cfg_filters.get("rsi_period", 14))
+    rsi_vals = rsi(closes, rsi_period)
+    last_rsi = rsi_vals[-1] if rsi_vals else None
+    debug_info["rsi"] = last_rsi
+
+    long_overbought = float(cfg_filters.get("rsi_long_overbought", 80))  # 默认 80，比较难挡住多头
+    short_oversold = float(cfg_filters.get("rsi_short_oversold", 20))    # 默认 20，比较难挡住空头
+
+    if last_rsi is not None:
+        if final_signal == 1 and last_rsi >= long_overbought:
+            debug_info["blocked_by_rsi"] = "long_blocked_overbought"
+            final_signal = 0
+        elif final_signal == -1 and last_rsi <= short_oversold:
+            debug_info["blocked_by_rsi"] = "short_blocked_oversold"
+            final_signal = 0
+
+    # --- 3）暴跌过滤（默认只有极端大跌才挡住做多） ---
+    crash_lookback = int(cfg_filters.get("crash_lookback", 6))
+    crash_threshold = float(cfg_filters.get("crash_threshold", -0.07))  # 最近 N 根累计跌幅 <= -7% 才算暴跌
+    crashed = detect_crash(closes, crash_lookback, crash_threshold)
+    debug_info["crashed"] = crashed
+
+    if crashed and final_signal == 1:
+        debug_info["blocked_by_crash"] = "long_blocked_after_crash"
+        final_signal = 0
+
+    # --- 4）ATR 波动率过滤 ---
+    atr_period = int(cfg_filters.get("atr_period", 14))
+    atr_min_pct = float(cfg_filters.get("atr_min_pct", 0.002))  # 比如 0.2% 的日内波动
+
+    atr_val = atr_from_closes(closes, atr_period)
+    atr_pct = None
+    if atr_val is not None and closes[-1] != 0:
+        atr_pct = atr_val / closes[-1]
+
+    debug_info["atr"] = atr_val
+    debug_info["atr_pct"] = atr_pct
+
+    if atr_pct is not None and atr_pct < atr_min_pct:
+        # 波动太小，视为震荡，不做
+        debug_info["blocked_by_atr"] = f"low_vol: atr_pct={atr_pct:.6f} < {atr_min_pct:.6f}"
+        final_signal = 0
+
+    # --- 5）EMA 斜率过滤（角度过滤） ---
+    fast_len = int(debug_info.get("fast", cfg_filters.get("fast_len_for_slope", 12)))
+    slope_lookback = int(cfg_filters.get("slope_lookback", 3))
+    slope_min_abs = float(cfg_filters.get("slope_min_abs", 0.0005))  # 0.05%
+
+    fast_ema_vals = ema(closes, fast_len)
+    fast_slope = None
+    if len(fast_ema_vals) > slope_lookback:
+        prev_val = fast_ema_vals[-1 - slope_lookback]
+        last_val = fast_ema_vals[-1]
+        if prev_val != 0:
+            fast_slope = (last_val - prev_val) / prev_val
+
+    debug_info["fast_slope"] = fast_slope
+
+    if fast_slope is not None:
+        if abs(fast_slope) < slope_min_abs:
+            debug_info["blocked_by_slope"] = f"flat_ma: slope={fast_slope:.6f} < {slope_min_abs:.6f}"
+            final_signal = 0
+        else:
+            # 方向与信号不一致也过滤掉
+            if final_signal == 1 and fast_slope < 0:
+                debug_info["blocked_by_slope"] = f"long_blocked_by_down_slope: slope={fast_slope:.6f}"
+                final_signal = 0
+            elif final_signal == -1 and fast_slope > 0:
+                debug_info["blocked_by_slope"] = f"short_blocked_by_up_slope: slope={fast_slope:.6f}"
+                final_signal = 0
+
+    return final_signal
+
+
+# ---------- 对外主函数 ----------
+
+def generate_signal(
+    symbol: str,
+    klines: List[List[Any]],
+    cfg: Dict[str, Any],
+    htf_klines: Optional[List[List[Any]]] = None,
+    debug: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    debug_info: Dict[str, Any] = {"symbol": symbol}
+
+    closes = extract_closes(klines)
+    if len(closes) < 10:
+        debug_info["reason"] = "not_enough_data"
+        if debug:
+            print(f"[DEBUG][strategy] {symbol} -> raw=0, info={debug_info}")
+        return 0, debug_info
+
+    logic = cfg.get("logic", {})
+    filters_cfg = cfg.get("filters", {})
+
+    fast = int(logic.get("fast", 12))
+    slow = int(logic.get("slow", 26))
+    sig = int(logic.get("sig", 9))
+
+    # ① 基础信号层
+    raw_signal, base_info = base_signal_from_ma(closes, fast, slow, sig)
+    debug_info.update(base_info)
+    debug_info["raw_signal"] = raw_signal
+    debug_info["fast"] = fast
+    debug_info["slow"] = slow
+    debug_info["sig"] = sig
+
+    if raw_signal == 0:
+        # 没有明显方向（快慢 EMA 几乎重合），这里直接返回 0
+        debug_info["reason"] = "ma_flat"
+        if debug:
+            print(f"[DEBUG][strategy] {symbol} -> raw=0, info={debug_info}")
+        return 0, debug_info
+
+    # ② 过滤层
+    htf_closes = extract_closes(htf_klines) if htf_klines else None
+    final_signal = apply_filters(
+        raw_signal=raw_signal,
+        closes=closes,
+        htf_closes=htf_closes,
+        cfg_filters=filters_cfg,
+        debug_info=debug_info,
+    )
+    debug_info["final_signal"] = final_signal
+
+    if debug:
+        print(f"[DEBUG][strategy] {symbol} -> raw={raw_signal}, final={final_signal}, info={debug_info}")
+
+    return final_signal, debug_info
