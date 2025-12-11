@@ -19,6 +19,11 @@ import requests
 
 from bot.trader import OKXTrader, load_config
 from bot.strategy import generate_signal
+# 尝试导入企业微信推送函数，如果没有就静默忽略
+try:
+    from wecom_notify import send_wecom_text  # 如果你以前的函数名不是这个，下面我会给兼容写法
+except Exception:
+    send_wecom_text = None
 
 
 def symbol_to_inst_id(symbol: str) -> str:
