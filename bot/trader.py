@@ -7,6 +7,7 @@ import hashlib
 from typing import Any, Dict, Optional, List
 
 import requests
+import urllib.parse
 
 
 CONFIG_PATH = os.environ.get("BOT_CONFIG_PATH", "config/params.json")
