@@ -25,6 +25,11 @@
     "rsi_long_overbought": 80,
     "rsi_short_oversold": 20,
     "crash_lookback": 6,
-    "crash_threshold": -0.07
+    "crash_threshold": -0.07,
+    "breakout_lookback": 5,
+    "atr_period": 14,
+    "atr_min_pct": 0.002,
+    "slope_lookback": 3,
+    "slope_min_abs": 0.0005
   }
 }
