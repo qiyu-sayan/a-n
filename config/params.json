@@ -1,10 +1,13 @@
-{
-  "symbols": [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "ASTERUSDT"
-  ],
+"symbols": [
+  "BTCUSDT",
+  "ETHUSDT",
+  "DOGEUSDT",
+  "SOLUSDT",
+  "OKBUSDT",
+  "XRPUSDT",
+  "BCHUSDT"
+],
+
   "interval": "1h",
   "risk": {
     "max_pos": 0.05,
