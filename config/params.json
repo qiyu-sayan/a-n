@@ -10,8 +10,8 @@
   "interval": "1h",
   "risk": {
     "max_pos": 0.065,
-    "stop": 0.02,
-    "take": 0.04
+    "stop": 0.05,
+    "take": 0.10
   },
   "logic": {
     "fast": 12,
