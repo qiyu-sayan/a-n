@@ -435,9 +435,9 @@ class OKXTrader:
         从 OKX 获取 K 线数据，返回按时间从旧到新的 DataFrame，
         列包括: open_time, open, high, low, close, volume
 
-        inst_id: 例如 "BTC-USDT-SWAP"
-        bar:    例如 "1H", "4H"
-        limit:  获取多少根，最大 200
+        兼容两种返回格式：
+        1）OKX 原始 list: [ts, o, h, l, c, vol, ...]
+        2）你自己在 _request 里封装过的 dict: {"ts": ..., "o": ..., "h": ..., "l": ..., "c": ..., "vol": ...}
         """
         path = "/api/v5/market/candles"
         params = {
@@ -445,23 +445,50 @@ class OKXTrader:
             "bar": bar,
             "limit": str(limit),
         }
+
         data = self._request("GET", path, params=params)
 
-        # OKX 返回是「最新在前」，我们反转成「最老在前」
         rows = []
+        # OKX 返回通常是“最新在前”，我们统一反转成“最老在前”
         for item in reversed(data):
-            # 文档格式: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm, ...]
-            ts, o, h, l, c, vol, *_ = item
-            rows.append({
-                "open_time": datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc),
-                "open": float(o),
-                "high": float(h),
-                "low": float(l),
-                "close": float(c),
-                "volume": float(vol),
-            })
+            # --- 情况 1：item 是 dict ---
+            if isinstance(item, dict):
+                ts = item.get("ts") or item.get("t") or item.get("time")
+                o = item.get("o") or item.get("open")
+                h = item.get("h") or item.get("high")
+                l = item.get("l") or item.get("low")
+                c = item.get("c") or item.get("close") or o
+                vol = item.get("vol") or item.get("volume") or 0
+            # --- 情况 2：item 是 list / tuple ---
+            else:
+                if len(item) < 5:
+                    # 连 ts,o,h,l,c 都凑不够，就跳过
+                    continue
+                ts = item[0]
+                o = item[1]
+                h = item[2]
+                l = item[3]
+                c = item[4]
+                vol = item[5] if len(item) > 5 else 0
+
+            try:
+                ts_dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+                rows.append(
+                    {
+                        "open_time": ts_dt,
+                        "open": float(o),
+                        "high": float(h),
+                        "low": float(l),
+                        "close": float(c),
+                        "volume": float(vol),
+                    }
+                )
+            except Exception:
+                # 某一根数据脏了就忽略，不影响整体
+                continue
 
         return pd.DataFrame(rows)
+
 
 
 if __name__ == "__main__":
