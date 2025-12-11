@@ -27,6 +27,86 @@ try:
 except Exception:
     send_wecom_text = None
 
+def check_risk_close(
+    symbol,
+    inst_id,
+    last_price,
+    positions,
+    cfg,
+    trader,
+    send_wecom_text=None,
+):
+    """
+    根据配置里的 stop / take，对当前持仓做止盈止损检查。
+    返回值：
+        True  -> 发生了平仓，本轮后续不再开新仓
+        False -> 没有触发止盈止损
+    """
+    risk = cfg.get("risk", {})
+    stop_pct = float(risk.get("stop", 0.02))   # 默认止损 2%
+    take_pct = float(risk.get("take", 0.04))   # 默认止盈 4%
+
+    if not positions:
+        return False
+
+    closed_any = False
+
+    for pos in positions:
+        try:
+            side = pos.get("posSide")          # "long" 或 "short"
+            pos_sz = float(pos.get("pos", "0"))
+            if pos_sz == 0:
+                continue
+            avg_px = float(pos.get("avgPx"))
+        except (TypeError, ValueError):
+            continue
+
+        # 计算浮动收益百分比
+        if side == "long":
+            pnl_pct = (last_price - avg_px) / avg_px
+        elif side == "short":
+            pnl_pct = (avg_px - last_price) / avg_px
+        else:
+            continue
+
+        reason = None
+        # 止损优先
+        if pnl_pct <= -stop_pct:
+            reason = f"止损触发：浮动收益 {pnl_pct * 100:.2f}% ≤ -{stop_pct * 100:.2f}%"
+        # 再看止盈
+        elif pnl_pct >= take_pct:
+            reason = f"止盈触发：浮动收益 {pnl_pct * 100:.2f}% ≥ {take_pct * 100:.2f}%"
+
+        if not reason:
+            continue
+
+        # 打印日志 + 平仓
+        if side == "long":
+            print(f"[RISK] Closing LONG {symbol} by rule: {reason}")
+            trader.close_long(inst_id, abs(pos_sz))
+            side_cn = "多"
+        else:
+            print(f"[RISK] Closing SHORT {symbol} by rule: {reason}")
+            trader.close_short(inst_id, abs(pos_sz))
+            side_cn = "空"
+
+        # 企业微信推送
+        if send_wecom_text is not None:
+            msg = (
+                f"[风险平仓-{symbol}] 平{side_cn}仓\n"
+                f"{reason}\n"
+                f"开仓价: {avg_px}, 当前价: {last_price}\n"
+                f"浮动收益: {pnl_pct * 100:.2f}%"
+            )
+            try:
+                send_wecom_text(msg)
+            except Exception as e:
+                print(f"[WARN] wecom notify failed: {e}")
+
+        closed_any = True
+
+    return closed_any
+
 
 def symbol_to_inst_id(symbol: str) -> str:
     """
