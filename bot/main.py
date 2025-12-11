@@ -157,6 +157,9 @@ def run_once(cfg: Dict[str, Any]) -> None:
         try:
             klines = trader.get_klines(inst_id, bar, 300)
             htf_klines = trader.get_klines(inst_id, htf_bar, 300)
+            
+            print(f"[DEBUG][KLINES] {symbol}: len(klines)={len(klines)}, len(htf_klines)={len(htf_klines)}")
+            
         except Exception as e:
             print(f"[ERROR] fetch klines failed for {symbol}: {e}")
             continue
