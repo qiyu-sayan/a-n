@@ -105,8 +105,11 @@ class OKXTrader:
         )
         data = resp.json()
         if data.get("code") != "0":
+            # 打印完整返回，方便在 GitHub Actions 日志里看到 sCode/sMsg
+            print("OKX raw error response:", data)
             raise OKXAPIError(f"OKX API error: {data.get('code')} {data.get('msg')}")
         return data
+
 
     # ---------- 公共数据 / 账户信息 ----------
 
@@ -291,7 +294,9 @@ class OKXTrader:
             "posSide": pos_side,      # "long" / "short"（双向持仓）
             "ordType": ord_type,
             "sz": sz,
+            "ccy": "USDT",            # U 本位合约用 USDT 作为保证金
         }
+
 
         if px is not None and ord_type == "limit":
             body["px"] = px
