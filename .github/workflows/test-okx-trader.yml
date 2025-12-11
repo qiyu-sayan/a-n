@@ -34,5 +34,5 @@ jobs:
           OKX_API_SECRET: ${{ secrets.OKX_PAPER_API_SECRET }}
           OKX_API_PASSPHRASE: ${{ secrets.OKX_PAPER_API_PASSPHRASE }}
         run: |
-          python test_okx_trader.py
+          python bot/test_okx_trader.py
 
