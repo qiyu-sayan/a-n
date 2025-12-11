@@ -1,23 +1,30 @@
-"symbols": [
-  "BTCUSDT",
-  "ETHUSDT",
-  "DOGEUSDT",
-  "SOLUSDT",
-  "OKBUSDT",
-  "XRPUSDT",
-  "BCHUSDT"
-],
-
+{
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "DOGEUSDT",
+    "SOLUSDT",
+    "OKBUSDT",
+    "XRPUSDT",
+    "BCHUSDT"
+  ],
   "interval": "1h",
   "risk": {
-    "max_pos": 0.05,
+    "max_pos": 0.065,
     "stop": 0.02,
     "take": 0.04
   },
   "logic": {
-    "type": "dual_ma",
     "fast": 12,
     "slow": 26,
     "sig": 9
+  },
+  "filters": {
+    "htf_ma_period": 50,
+    "rsi_period": 14,
+    "rsi_long_overbought": 80,
+    "rsi_short_oversold": 20,
+    "crash_lookback": 6,
+    "crash_threshold": -0.07
   }
 }
