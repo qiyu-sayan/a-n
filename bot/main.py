@@ -149,20 +149,92 @@ def run_once(cfg: Dict[str, Any]) -> None:
 
     trader = OKXTrader(cfg, use_demo=use_demo)
 
-    for symbol in cfg.get("symbols", []):
-        inst_id = symbol_to_inst_id(symbol)
-        print(f"=== {symbol} / {inst_id} ===")
+for symbol in cfg.get("symbols", []):
+    inst_id = symbol_to_inst_id(symbol)
+    print(f"=== {symbol} / {inst_id} ===")
 
-        # --- 获取 K 线数据 ---
+    # ========= 1. 风控检查：已有持仓先看要不要止盈 / 止损 =========
+    risk_conf = cfg.get("risk", {})
+    stop = float(risk_conf.get("stop", 0.05))   # 例如 0.05 = -5% 止损
+    take = float(risk_conf.get("take", 0.10))   # 例如 0.10 = +10% 止盈
+
+    risk_closed = False
+
+    try:
+        positions = trader.get_positions(inst_id)
+    except Exception as e:
+        print(f"[ERROR][RISK] get_positions failed for {symbol}: {e}")
+        positions = []
+
+    # OKX 可能返回多条 long/short，这里逐条检查
+    for pos in positions:
+        side = (pos.get("posSide") or "").lower()   # 'long' / 'short'
+        sz_str = pos.get("pos") or "0"
         try:
-            klines = trader.get_klines(inst_id, bar, 300)
-            htf_klines = trader.get_klines(inst_id, htf_bar, 300)
-            
-            print(f"[DEBUG][KLINES] {symbol}: len(klines)={len(klines)}, len(htf_klines)={len(htf_klines)}")
-            
-        except Exception as e:
-            print(f"[ERROR] fetch klines failed for {symbol}: {e}")
+            sz = float(sz_str)
+        except ValueError:
+            sz = 0.0
+
+        if sz == 0:
             continue
+
+        # 尝试从 uplRatio 拿浮盈亏比例；demo 盘一般也有这个字段
+        upl_ratio_raw = pos.get("uplRatio") or "0"
+        try:
+            pnl_pct = float(upl_ratio_raw)
+        except ValueError:
+            pnl_pct = 0.0
+
+        print(
+            f"[DEBUG][RISK] {symbol} {side} pos={sz}, "
+            f"pnl_pct={pnl_pct:.4f}, stop={stop}, take={take}"
+        )
+
+        close_reason = None
+        if pnl_pct <= -stop:
+            close_reason = f"stop_loss {pnl_pct:.4f} <= -{stop}"
+        elif pnl_pct >= take:
+            close_reason = f"take_profit {pnl_pct:.4f} >= {take}"
+
+        if close_reason:
+            print(f"[ACTION][RISK] closing {side.upper()} {symbol} due to {close_reason}")
+
+            try:
+                if side == "long":
+                    trader.close_long(inst_id, sz)
+                elif side == "short":
+                    trader.close_short(inst_id, sz)
+            except Exception as e:
+                print(f"[ERROR][RISK] close position failed for {symbol}: {e}")
+            else:
+                # 企业微信风控推送
+                try:
+                    human_side = "多" if side == "long" else "空"
+                    msg = (
+                        f"⚠️ 风控平仓 {symbol}\n"
+                        f"方向：{human_side}\n"
+                        f"浮盈亏比例：{pnl_pct:.2%}\n"
+                        f"原因：{close_reason}"
+                    )
+                    send_wecom_text(msg)
+                except Exception as e:
+                    print(f"[WECOM][RISK] send failed: {e}")
+
+            # 这一轮对该 symbol 就结束，不再继续开新仓
+            risk_closed = True
+            break
+
+    if risk_closed:
+        # 已经因为风控平仓，本轮不再生成信号 / 开新仓，直接看下一个 symbol
+        continue
+
+    # ========= 2. 正常流程：获取 K 线 =========
+    try:
+        klines = trader.get_klines(inst_id, bar, 300)
+        htf_klines = trader.get_klines(inst_id, htf_bar, 300)
+    except Exception as e:
+        print(f"[ERROR] fetch klines failed for {symbol}: {e}")
+        continue
 
         # --- 生成策略信号 ---
         signal, info = generate_signal(
