@@ -3,6 +3,30 @@ import sys
 import traceback
 from datetime import datetime
 
+def okx_bar(interval: str) -> str:
+    """
+    把通用 interval 转成 OKX 接受的 bar 参数
+    """
+    m = {
+        "1m": "1m",
+        "3m": "3m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+
+        "1h": "1H",
+        "2h": "2H",
+        "4h": "4H",
+        "6h": "6H",
+        "12h": "12H",
+
+        "1d": "1D",
+        "1w": "1W"
+    }
+    k = interval.strip().lower()
+    return m.get(k, interval)
+
+
 # 包内导入
 from .trader import OKXTrader, load_config
 from .strategy import generate_signal
@@ -93,8 +117,9 @@ def run_once(cfg: dict) -> None:
     print(f"[ENV] BOT_ENV={env}, use_demo={use_demo}")
 
     interval = cfg.get("interval", "1h")
-    bar = interval.upper()
-    htf_bar = cfg.get("htf_bar", "4H")
+    bar = okx_bar(interval)
+    htf_bar = okx_bar(cfg.get("htf_bar", "4h"))
+
 
     print(f"Running bot once, interval={interval}, bar={bar}, htf_bar={htf_bar}")
 
