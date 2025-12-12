@@ -16,7 +16,7 @@
     "mode": "B",
 
     "B": {
-      "pullback_near_pct": 0.008,
+      "pullback_near_pct": 0.015,
       "guard_break_pct": 0.0,
       "require_structure": true,
       "confirm_mode": "close",
