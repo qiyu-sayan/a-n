@@ -7,8 +7,18 @@ from datetime import datetime
 from .trader import OKXTrader, load_config
 from .strategy import generate_signal
 
-# 根目录的企业微信推送
-from wecom_notify import send_text as send_wecom_text
+# 根目录的企业微信推送：兼容多种函数名，如果都没有就退化成打印
+try:
+    # 尝试优先用 send_text（如果你之前是这个名字，直接就能用）
+    from wecom_notify import send_text as send_wecom_text
+except ImportError:
+    try:
+        # 有些版本里我们叫 send_markdown，这里也兼容一下
+        from wecom_notify import send_markdown as send_wecom_text
+    except ImportError:
+        # 如果两个名字都没有，就做一个兜底的 mock，至少不影响交易本身运行
+        def send_wecom_text(msg: str) -> None:
+            print(f"[WECOM MOCK] {msg}")
 
 
 # ---------- 小工具 ----------
