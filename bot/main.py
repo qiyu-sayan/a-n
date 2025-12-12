@@ -149,7 +149,7 @@ def run_once(cfg: Dict[str, Any]) -> None:
 
     trader = OKXTrader(cfg, use_demo=use_demo)
 
-for symbol in cfg.get("symbols", []):
+    for symbol in cfg.get("symbols", []):
     inst_id = symbol_to_inst_id(symbol)
     print(f"=== {symbol} / {inst_id} ===")
 
