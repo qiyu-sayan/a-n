@@ -1,21 +1,80 @@
 {
   "symbols": [
-    "BTCUSDT",
     "ETHUSDT",
-    "DOGEUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "BCHUSDT"
+    "BTCUSDT",
+    "ZECUSDT",
+    "ASTERUSDT"
   ],
-  "interval": "1h",
-  "risk": {
-    "max_pos": 0.071,
-    "stop": 0.05,
-    "take": 0.1
-  },
+
+  "interval": "15m",
+  "htf_bar": "4H",
+
   "logic": {
+    "mode": "B",
+
+    "B": {
+      "pullback_near_pct": 0.003,
+      "guard_break_pct": 0.0,
+      "require_structure": true,
+      "confirm_mode": "close",
+
+      "htf_fast": 50,
+      "htf_slow": 200,
+
+      "entry_ma1": 20,
+      "entry_ma2": 30,
+      "guard_ma": 50,
+
+      "use_rsi_filter": true,
+      "use_atr_filter": true
+    },
+
     "fast": 12,
     "slow": 26,
     "sig": 9
+  },
+
+  "filters": {
+    "htf_ma_period": 50,
+
+    "rsi_period": 14,
+    "rsi_long_overbought": 80,
+    "rsi_short_oversold": 20,
+
+    "crash_lookback": 6,
+    "crash_threshold": -0.07,
+
+    "breakout_lookback": 5,
+
+    "atr_period": 14,
+    "atr_min_pct": 0.002,
+
+    "fast_len_for_slope": 12,
+    "slope_lookback": 3,
+    "slope_min_abs": 0.0005
+  },
+
+  "risk": {
+    "max_pos": 0.005,
+    "stop": 0.05,
+    "take": 0.10
+  },
+
+  "execution": {
+    "use_limit": false,
+    "limit_offset": 0.001,
+    "tp_sl_price_type": "last"
+  },
+
+  "notify": {
+    "enable": true,
+    "on_open": true,
+    "on_close": true,
+    "on_error": true
+  },
+
+  "debug": {
+    "print_signal_info": true,
+    "print_kline_len": true
   }
 }
