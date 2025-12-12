@@ -1,10 +1,13 @@
 {
   "symbols": [
-    "ETHUSDT",
     "BTCUSDT",
-    "ZECUSDT",
-    "ASTERUSDT"
-  ],
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "BCHUSDT"
+  ]
+,
 
   "interval": "15m",
   "htf_bar": "4H",
@@ -13,7 +16,7 @@
     "mode": "B",
 
     "B": {
-      "pullback_near_pct": 0.003,
+      "pullback_near_pct": 0.008,
       "guard_break_pct": 0.0,
       "require_structure": true,
       "confirm_mode": "close",
