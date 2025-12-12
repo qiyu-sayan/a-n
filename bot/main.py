@@ -9,30 +9,20 @@ from .strategy import generate_signal
 
 # 根目录的企业微信推送：兼容多种函数名，如果都没有就退化成打印
 try:
-    # 尝试优先用 send_text（如果你之前是这个名字，直接就能用）
     from wecom_notify import send_text as send_wecom_text
 except ImportError:
     try:
-        # 有些版本里我们叫 send_markdown，这里也兼容一下
         from wecom_notify import send_markdown as send_wecom_text
     except ImportError:
-        # 如果两个名字都没有，就做一个兜底的 mock，至少不影响交易本身运行
         def send_wecom_text(msg: str) -> None:
             print(f"[WECOM MOCK] {msg}")
 
 
-# ---------- 小工具 ----------
-
 def symbol_to_inst_id(symbol: str) -> str:
-    """
-    把 BTCUSDT -> BTC-USDT-SWAP 这种 OKX 合约 instId
-    之前我们也用过类似逻辑，这里在 main 里再实现一遍，避免导入问题。
-    """
     symbol = symbol.upper()
     if symbol.endswith("USDT"):
         base = symbol[:-4]
         return f"{base}-USDT-SWAP"
-    # 兜底：直接原样返回，方便调试
     return symbol
 
 
@@ -42,11 +32,6 @@ def notify_order(action: str,
                  price: float | None = None,
                  size: float | None = None,
                  extra: str | None = None) -> None:
-    """
-    企业微信下单 / 平仓 推送统一封装
-    action: "开仓" / "平仓" / "风控平仓" / etc.
-    side: "多" / "空"
-    """
     try:
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         lines = [
@@ -66,22 +51,49 @@ def notify_order(action: str,
         msg = "\n".join(lines)
         send_wecom_text(msg)
     except Exception as e:
-        # 推送失败不要影响交易本身
         print(f"[WECOM] send failed: {e}", file=sys.stderr)
 
 
-# ---------- 主逻辑 ----------
+def _format_signal_extra(info: dict) -> str:
+    """
+    把策略 debug_info 拼成推送文案（重点：为什么下单）
+    """
+    name = info.get("signal_name") or "unknown"
+    reason = info.get("signal_reason") or info.get("reason") or "n/a"
+
+    # B 策略关键参数
+    parts = []
+    if "B_trend" in info:
+        parts.append(f"趋势：{info.get('B_trend')}")
+    if "B_ema20" in info and "B_ema30" in info and "B_ema50" in info:
+        parts.append(f"EMA20/30/50：{info['B_ema20']:.4f}/{info['B_ema30']:.4f}/{info['B_ema50']:.4f}")
+    if "B_pullback_close" in info:
+        parts.append(f"回踩收盘：{info['B_pullback_close']:.4f}")
+    if "B_confirm_close" in info:
+        parts.append(f"确认收盘：{info['B_confirm_close']:.4f}")
+
+    # 通用指标
+    if info.get("rsi") is not None:
+        parts.append(f"RSI：{info.get('rsi')}")
+    if info.get("atr_pct") is not None:
+        parts.append(f"ATR%：{info.get('atr_pct')}")
+
+    extra_lines = [
+        f"信号：{name}",
+        f"原因：{reason}",
+    ]
+    if parts:
+        extra_lines.append(" | ".join(parts))
+    return "\n".join(extra_lines)
+
 
 def run_once(cfg: dict) -> None:
-    """运行一次策略（对应 GitHub Actions 的一次 run-bot）"""
-
-    # 1. 环境 & 交易对象初始化
     env = os.getenv("BOT_ENV", "test").lower()
     use_demo = env != "live"
     print(f"[ENV] BOT_ENV={env}, use_demo={use_demo}")
 
     interval = cfg.get("interval", "1h")
-    bar = interval.upper()          # 1h -> 1H
+    bar = interval.upper()
     htf_bar = cfg.get("htf_bar", "4H")
 
     print(f"Running bot once, interval={interval}, bar={bar}, htf_bar={htf_bar}")
@@ -89,11 +101,10 @@ def run_once(cfg: dict) -> None:
     trader = OKXTrader(cfg, use_demo=use_demo)
 
     risk_conf = cfg.get("risk", {})
-    max_pos_pct = float(risk_conf.get("max_pos", 0.005))  # 最大单笔仓位占权益
-    stop = float(risk_conf.get("stop", 0.05))             # 止损，例如 0.05 = -5%
-    take = float(risk_conf.get("take", 0.10))             # 止盈，例如 0.10 = +10%
+    max_pos_pct = float(risk_conf.get("max_pos", 0.005))
+    stop = float(risk_conf.get("stop", 0.05))
+    take = float(risk_conf.get("take", 0.10))
 
-    # 2. 遍历每个交易品种
     for symbol in cfg.get("symbols", []):
         inst_id = symbol_to_inst_id(symbol)
         print(f"=== {symbol} / {inst_id} ===")
@@ -107,7 +118,7 @@ def run_once(cfg: dict) -> None:
             positions = []
 
         for pos in positions:
-            pos_side = (pos.get("posSide") or "").lower()  # 'long' / 'short'
+            pos_side = (pos.get("posSide") or "").lower()
             sz_str = pos.get("pos") or "0"
             try:
                 sz = float(sz_str)
@@ -129,7 +140,6 @@ def run_once(cfg: dict) -> None:
             )
 
             close_reason = None
-            # uplRatio 通常是小数（0.05 = +5%），也有些返回百分比；这里假设是小数
             if pnl_pct <= -stop:
                 close_reason = f"stop_loss {pnl_pct:.4f} <= -{stop}"
             elif pnl_pct >= take:
@@ -155,7 +165,6 @@ def run_once(cfg: dict) -> None:
                     )
                 except Exception as e:
                     print(f"[ERROR][RISK] close position failed for {symbol}: {e}")
-                # 不管成功与否，本轮都不再对这个 symbol 开新仓
                 risk_closed = True
                 break
 
@@ -229,12 +238,11 @@ def run_once(cfg: dict) -> None:
             print(f"[ERROR] get_last_price failed for {symbol}: {e}")
             last = None
 
-        # signal: -1 -> 做空, 1 -> 做多, 0 -> 不操作
         if signal == 0:
             print("[ACTION] no clear signal, do nothing.")
             continue
 
-        # 先处理“反向平仓”的情况
+        # 先处理反向平仓
         if signal == 1 and has_short:
             print("[ACTION] close existing SHORT before opening LONG")
             try:
@@ -265,16 +273,14 @@ def run_once(cfg: dict) -> None:
             except Exception as e:
                 print(f"[ERROR] close_long failed for {symbol}: {e}")
 
-        # 再根据信号决定是否开新仓
+        # 再根据信号决定是否开新仓（并把信号原因推送出去）
         if signal == 1:
             if has_long and not has_short:
                 print("[ACTION] already long, no new long opened")
             else:
                 print("Opening long ...")
                 try:
-                    # 不传 size，交给 OKXTrader 里根据 max_pos_pct 自动算
-                    resp = trader.open_long(inst_id, ref_price=last,
-                                            max_pos_pct=max_pos_pct)
+                    resp = trader.open_long(inst_id, ref_price=last, max_pos_pct=max_pos_pct)
                     print(f"[DEBUG] open_long resp: {resp}")
                     notify_order(
                         action="开多",
@@ -282,6 +288,7 @@ def run_once(cfg: dict) -> None:
                         side="多",
                         price=last,
                         size=None,
+                        extra=_format_signal_extra(info),
                     )
                 except Exception as e:
                     print(f"[ERROR] open_long failed for {symbol}: {e}")
@@ -292,8 +299,7 @@ def run_once(cfg: dict) -> None:
             else:
                 print("Opening short ...")
                 try:
-                    resp = trader.open_short(inst_id, ref_price=last,
-                                             max_pos_pct=max_pos_pct)
+                    resp = trader.open_short(inst_id, ref_price=last, max_pos_pct=max_pos_pct)
                     print(f"[DEBUG] open_short resp: {resp}")
                     notify_order(
                         action="开空",
@@ -301,6 +307,7 @@ def run_once(cfg: dict) -> None:
                         side="空",
                         price=last,
                         size=None,
+                        extra=_format_signal_extra(info),
                     )
                 except Exception as e:
                     print(f"[ERROR] open_short failed for {symbol}: {e}")
