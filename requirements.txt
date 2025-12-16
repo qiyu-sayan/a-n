@@ -7,3 +7,4 @@ binance-connector
 python-dotenv
 ccxt
 python_binance
+okx
