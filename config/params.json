@@ -1,35 +1,49 @@
 {
+  "daemon": true,
+
+  "entry_interval_sec": 900,
+  "risk_loop_interval": 5,
+
   "symbols": [
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
-    "XRPUSDT",
     "DOGEUSDT",
+    "XRPUSDT",
     "BCHUSDT"
   ],
+
   "interval": "15m",
+  "limit": 200,
+
+  "htf_bar": "4h",
+  "htf_limit": 200,
+
   "risk": {
-    "max_pos": 0.05,
-    "stop": 0.05,
-    "take": 0.1
-  },
-  "logic": {
-    "mode": "B",
-    "B": {
-      "pullback_near_pct": 0.015,
-      "guard_break_pct": 0.0,
-      "require_structure": true,
-      "confirm_mode": "close",
-      "htf_fast": 50,
-      "htf_slow": 200,
-      "entry_ma1": 20,
-      "entry_ma2": 30,
-      "guard_ma": 50,
-      "use_rsi_filter": true,
-      "use_atr_filter": true
+    "max_pos": 0.005,
+
+    "leverage": {
+      "BTC": 5,
+      "ETH": 5,
+      "DEFAULT": 3
     },
-    "fast": 12,
-    "slow": 26,
-    "sig": 9
+
+    "max_notional_usdt_per_symbol": 600,
+    "max_contracts_per_symbol": 3
+  },
+
+  "tp_sl": {
+    "BTC": { "tp": 0.06, "sl": 0.04 },
+    "ETH": { "tp": 0.06, "sl": 0.04 },
+    "DEFAULT": { "tp": 0.08, "sl": 0.05 }
+  },
+
+  "trade_journal_path": "trade_journal.csv",
+
+  "stats": {
+    "enable": true,
+    "push_on_close": true,
+    "daily_summary": true,
+    "daily_push_hour": 8
   }
 }
