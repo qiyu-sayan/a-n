@@ -5,7 +5,14 @@ import csv
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from okx import Trade, Account, Market
+from okx import Trade, Account
+try:
+    # 一些版本叫 MarketData
+    from okx import MarketData as Market
+except ImportError:
+    # 少数版本才叫 Market
+    from okx import Market
+
 
 from .wecom_notify import send_text as wecom_notify
 
