@@ -43,8 +43,43 @@ def _wecom_notify_error(title: str, detail: str) -> None:
 
 
 def load_config(path: str = "params.json") -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """
+    兼容 GitHub Actions / 本地 / 子目录运行：
+    1) 优先读取环境变量 BOT_CONFIG（若设置）
+    2) 依次尝试：传入 path、仓库根目录 params.json、config/params.json、bot/params.json
+    """
+    # 1) 环境变量强制指定
+    env_path = os.getenv("BOT_CONFIG", "").strip()
+    candidates = []
+    if env_path:
+        candidates.append(Path(env_path))
+
+    # 2) 传入路径（相对/绝对都行）
+    candidates.append(Path(path))
+
+    # 3) 以当前文件定位（bot/trader.py -> 仓库根目录）
+    here = Path(__file__).resolve()
+    repo_root = here.parents[1]  # bot/.. -> repo root
+    candidates += [
+        repo_root / "params.json",
+        repo_root / "config" / "params.json",
+        repo_root / "bot" / "params.json",
+    ]
+
+    for p in candidates:
+        try:
+            p = p.expanduser().resolve()
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                cfg["_config_path"] = str(p)
+                return cfg
+        except Exception:
+            continue
+
+    raise FileNotFoundError(
+        f"找不到配置文件。已尝试: {[str(c) for c in candidates]}"
+    )
 
 
 class OKXTrader:
