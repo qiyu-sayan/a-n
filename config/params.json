@@ -9,7 +9,7 @@
   ],
   "interval": "15m",
   "risk": {
-    "max_pos": 0.005,
+    "max_pos": 0.05,
     "leverage": {
       "BTC": 5,
       "ETH": 5,
